@@ -1,0 +1,56 @@
+cabal-version:      2.4
+name:               demeter
+version:            0.1.0.0
+
+author: Travis Staton <hello@travisstaton.com>
+category: Data, Database, Network
+copyright: 2022, Travis Staton
+extra-source-files: CHANGELOG.md
+homepage: https://github.com/awkward-squad/demeter
+license-file: LICENSE
+license: BSD-3-Clause
+maintainer: Travis Staton <hello@travisstaton.com>, Mitchell Rosen <mitchellwrosen@gmail.com>
+
+library
+    exposed-modules: Pool
+                     Pool.Queue
+
+    build-depends:    base >= 4.14 && < 5
+                      , stm ^>= 2.5
+
+    hs-source-dirs:   lib
+    default-language: Haskell2010
+    ghc-options:
+      -Wall
+      -Wcompat
+      -Widentities
+      -Wincomplete-record-updates
+      -Wincomplete-uni-patterns
+      -Wredundant-constraints
+      -Wpartial-fields
+      -O2
+
+test-suite test
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
+  build-depends: base
+               , demeter
+               , stm
+               , tasty
+               , tasty-hedgehog
+               , transformers
+               , containers
+               , hedgehog
+  hs-source-dirs: test
+  default-language: Haskell2010
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wredundant-constraints
+    -Wpartial-fields
+    -O1
+    -rtsopts
+    -threaded
