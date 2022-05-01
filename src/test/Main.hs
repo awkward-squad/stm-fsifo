@@ -13,10 +13,10 @@ import Data.IntMap (IntMap)
 import qualified Data.IntMap.Strict as IM
 import Data.Kind
 import Data.Maybe
+import qualified Demeter.Queue as Demeter
 import Hedgehog
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
-import qualified Pool.Queue as Pool
 import Test.Tasty
 import Test.Tasty.Hedgehog
 
@@ -33,7 +33,7 @@ main =
 
 prop_queue :: Property
 prop_queue = property do
-  qvar <- liftIO $ newTVarIO =<< Pool.newTDQueueIO
+  qvar <- liftIO $ newTVarIO =<< Demeter.newTDQueueIO
   actions <-
     forAll $
       Gen.sequential
@@ -56,7 +56,7 @@ prop_queue = property do
         }
 
     resetQ qvar = atomically do
-      q <- Pool.newTDQueue
+      q <- Demeter.newTDQueue
       writeTVar qvar q
 
     s_push qvar =
@@ -69,7 +69,7 @@ prop_queue = property do
               <$> liftIO
                 ( atomically do
                     q <- readTVar qvar
-                    Pool.push q n
+                    Demeter.push q n
                 )
           upd = Update \(QueueModel s pushCount im _) (Push i) out ->
             let !pushCount' = pushCount + 1
@@ -87,7 +87,7 @@ prop_queue = property do
           execute Pop = do
             liftIO $ atomically do
               q <- readTVar qvar
-              Pool.pop q
+              Demeter.pop q
           upd = Update \(QueueModel s pushCount im _) Pop _out ->
             let mk = fst <$> IM.lookupGE minBound s
                 s' = maybe s (\k -> IM.delete k s) mk
@@ -118,7 +118,7 @@ prop_queue = property do
               True -> Nothing
               False -> Just (pure Check)
           execute Check = do
-            liftIO (atomically $ Pool.toList =<< readTVar qvar)
+            liftIO (atomically $ Demeter.toList =<< readTVar qvar)
           upd = Update \(QueueModel im s pushCount _) Check _ ->
             QueueModel im s pushCount True
           postcond = Ensure \_ QueueModel {..} Check xs ->

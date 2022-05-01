@@ -1,6 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 
-module Pool.Queue
+module Demeter.Queue
   ( TDQueue (..),
     newTDQueue,
     newTDQueueIO,

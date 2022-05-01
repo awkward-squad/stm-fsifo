@@ -9,12 +9,16 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
-module Pool
-  ( Pool,
-    createPool,
+module Demeter
+  ( -- $introduction
+    Pool,
     withPool,
-    destroyPool,
     withResource,
+    Milliseconds (..),
+
+    -- * Discouraged (but sometimes necessary) alternatives to 'withPool'
+    createPool,
+    destroyPool,
   )
 where
 
@@ -25,15 +29,15 @@ import Control.Monad
 import Data.Coerce (coerce)
 import Data.Foldable (traverse_)
 import Data.Word (Word64)
+import Demeter.Queue
 import GHC.Clock (getMonotonicTimeNSec)
-import Pool.Queue
 
 data Pool a = Pool
   { availableResources :: {-# UNPACK #-} !(TVar [PoolEntry a]),
     awaitingResources :: {-# UNPACK #-} !(TDQueue (TMVar (ResourceNotification a))),
     createdResourceCount :: {-# UNPACK #-} !(TVar Int),
     maxResourceCount :: {-# UNPACK #-} !Int,
-    resourceExpiry :: {-# UNPACK #-} !NanoSeconds,
+    resourceExpiry :: {-# UNPACK #-} !Nanoseconds,
     acquireResource :: IO a,
     releaseResource :: a -> IO (),
     reaperThread :: {-# UNPACK #-} !(Thread ())
@@ -45,24 +49,21 @@ data ResourceNotification a
 
 data PoolEntry a
   = PoolEntry
-      {-# UNPACK #-} !NanoSeconds
+      {-# UNPACK #-} !Nanoseconds
       a
 
-entryTime :: PoolEntry a -> NanoSeconds
+entryTime :: PoolEntry a -> Nanoseconds
 entryTime (PoolEntry t _) = t
 
 entryValue :: PoolEntry a -> a
 entryValue (PoolEntry _ a) = a
 
+-- | See 'withPool'
 createPool ::
-  -- | acquire resource
   IO a ->
-  -- | release resource
   (a -> IO ()) ->
-  -- | max resource count
   Int ->
-  -- | resource expiry
-  MilliSeconds ->
+  Milliseconds ->
   IO (Pool a)
 createPool acquire release mx expiry = do
   let expiryNs = ms2ns expiry
@@ -83,30 +84,49 @@ createPool acquire release mx expiry = do
           }
   pure pool
 
-withPool :: IO a -> (a -> IO ()) -> Int -> MilliSeconds -> (Pool a -> IO b) -> IO b
+-- | Execute an action with a new resource pool.
+--
+-- When the callback returns the 'Pool' will be destroyed and all
+-- acquired resources will be released.
+withPool ::
+  -- | How to acquire a resource
+  IO a ->
+  -- | How to release a resource
+  (a -> IO ()) ->
+  -- | The largest number of resources that might be acquired but not
+  -- yet released
+  Int ->
+  -- | The amount of time that an acquired resource can go unused
+  -- before it is released
+  Milliseconds ->
+  -- | The action to execute with a new @Pool@
+  (Pool a -> IO b) ->
+  IO b
 withPool acquire release mx expiry = bracket (createPool acquire release mx expiry) destroyPool
 
-purgePool :: Pool a -> IO ()
-purgePool p@Pool {..} = do
-  xs <- atomically (readTVar availableResources)
-  traverse_ (try @SomeException . destroyResource p . entryValue) xs
-
+-- | See 'withPool'
 destroyPool :: Pool a -> IO ()
-destroyPool p@Pool {..} = do
+destroyPool Pool {..} = do
   let Thread tid doneVar = reaperThread
-  killThread tid
-  atomically (readTMVar doneVar) `onException` do
+  uninterruptibleMask_ do
     killThread tid
     atomically (readTMVar doneVar)
-  purgePool p
 
 data Thread a
   = Thread {-# UNPACK #-} !ThreadId {-# UNPACK #-} !(TMVar a)
 
-nanoSecondsToSleepTime :: NanoSeconds -> MicroSeconds
+nanoSecondsToSleepTime :: Nanoseconds -> Microseconds
 nanoSecondsToSleepTime w =
   -- don't sleep less than 1 second
   max 1000000 (ns2td w + 1)
+
+data UnexpectedReaperException
+  = UnexpectedReaperException SomeException
+  deriving stock (Show)
+
+instance Exception UnexpectedReaperException where
+  toException = asyncExceptionToException
+  fromException = asyncExceptionFromException
 
 -- | The reaper is responsible for releasing expired
 -- resources. Because we don't know how long it might take to release
@@ -120,7 +140,7 @@ nanoSecondsToSleepTime w =
 -- releasing the resources it had already checked out, but if a second
 -- exception is received then it kills all children and signals completion.
 forkReaper ::
-  NanoSeconds ->
+  Nanoseconds ->
   TDQueue (TMVar (ResourceNotification a)) ->
   TVar [PoolEntry a] ->
   TVar Int ->
@@ -129,15 +149,17 @@ forkReaper ::
 forkReaper expiry waiters resourceVar createdResourceCountVar destroyAction = do
   mtid <- myThreadId
   resVar <- newEmptyTMVarIO
-  workerCountVar <- newTVarIO 0
+  workerCountVar <- newTVarIO @Int 0
 
   tid <- mask_ $ forkIOWithUnmask \unmask -> do
     let errHandler e = do
           case fromException @AsyncException e of
             Just ThreadKilled -> do
+              reap =<< readTVarIO resourceVar
               waitForWorkers
-              atomically (putTMVar resVar ())
-            _ -> throwTo mtid e >> throwIO e
+            _ -> do
+              throwTo mtid (UnexpectedReaperException e)
+          atomically (putTMVar resVar ())
         expirySleepTime = nanoSecondsToSleepTime expiry
         action sleepTime = do
           nap sleepTime
@@ -152,17 +174,19 @@ forkReaper expiry waiters resourceVar createdResourceCountVar destroyAction = do
             -- activity or so much activity that resources are
             -- returned straight to waiters.
             [] -> atomically (guard . not . null =<< readTVar resourceVar) >> action (nanoSecondsToSleepTime expiry)
-            _ -> reap >>= action
-        reap = do
+            _ -> reapDead >>= action
+        reapDead = do
           ct <- getCurrentTime
           (living, dead) <- atomically do
             (living, dead) <- span (\x -> ct - expiry >= entryTime x) <$> readTVar resourceVar
             writeTVar resourceVar living
             pure (living, dead)
-          traverse_ releaseWithWorker (map entryValue dead)
+          reap dead
           pure $ case living of
             [] -> expirySleepTime
             _ -> nanoSecondsToSleepTime (entryTime $ last living)
+        reap xs = do
+          traverse_ (releaseWithWorker . entryValue) xs
         waitForWorkers = do
           atomically do
             readTVar workerCountVar >>= \case
@@ -170,36 +194,15 @@ forkReaper expiry waiters resourceVar createdResourceCountVar destroyAction = do
               _ -> retry
 
         releaseWithWorker resource = do
-          let workerAction x =
-                try @SomeException (unmask (destroyResource' destroyAction waiters resourceVar createdResourceCountVar x)) >>= \case
-                  Left e -> case fromException @AsyncException e of
-                    -- The reaper might kill us before we have
-                    -- finished releasing the resources, in which case
-                    -- we do not attempt to release the remaining
-                    -- resources.
-                    Just ThreadKilled -> throwIO e
-                    _ -> pure ()
-                  Right _ -> pure ()
           atomically do
             modifyTVar' workerCountVar (+ 1)
-          forkWorker workerCountVar (workerAction resource)
+          _tid <- forkIO do
+            unmask (destroyResource' destroyAction waiters resourceVar createdResourceCountVar resource) `catch` \(_ :: SomeException) -> pure ()
+            atomically do
+              modifyTVar' workerCountVar (subtract 1)
+          pure ()
     action (nanoSecondsToSleepTime expiry) `catch` (uninterruptibleMask_ . errHandler)
   pure (Thread tid resVar)
-
-forkWorker ::
-  -- | Worker count
-  TVar Int ->
-  -- | the work to do
-  IO () ->
-  -- | worker thread
-  IO ()
-forkWorker workerCount action = do
-  _tid <- forkIO do
-    action
-    atomically do
-      modifyTVar' workerCount (subtract 1)
-  pure ()
-{-# INLINE forkWorker #-}
 
 returnResourceSTM :: Pool a -> ResourceNotification a -> STM ()
 returnResourceSTM Pool {..} c = returnResourceSTM' awaitingResources availableResources createdResourceCount c
@@ -282,36 +285,47 @@ withResource p@(Pool {..}) k = do
     pure r
 {-# INLINEABLE withResource #-}
 
-newtype NanoSeconds
-  = NanoSeconds Word64
+newtype Nanoseconds
+  = Nanoseconds Word64
   deriving newtype (Num, Eq, Ord, Real, Enum, Integral)
 
-newtype MilliSeconds
-  = MilliSeconds Word64
+newtype Milliseconds
+  = Milliseconds Word64
+  deriving newtype (Eq, Ord, Enum)
+
+newtype Microseconds
+  = Microseconds Int
   deriving newtype (Num, Eq, Ord, Real, Enum, Integral)
 
-newtype MicroSeconds
-  = MicroSeconds Int
-  deriving newtype (Num, Eq, Ord, Real, Enum, Integral)
-
-ms2ns :: MilliSeconds -> NanoSeconds
-ms2ns (MilliSeconds x) =
+ms2ns :: Milliseconds -> Nanoseconds
+ms2ns (Milliseconds x) =
   let ns = x * 1000000
    in case ns < x of
-        True -> NanoSeconds maxBound
-        False -> NanoSeconds ns
+        True -> Nanoseconds maxBound
+        False -> Nanoseconds ns
 
-ns2td :: NanoSeconds -> MicroSeconds
-ns2td (NanoSeconds w) = case microseconds >= largestIntWord of
-  True -> MicroSeconds largestInt
-  False -> MicroSeconds (fromIntegral w)
+ns2td :: Nanoseconds -> Microseconds
+ns2td (Nanoseconds w) = case microseconds >= largestIntWord of
+  True -> Microseconds largestInt
+  False -> Microseconds (fromIntegral w)
   where
     microseconds = div w 1000
     largestInt = maxBound @Int
     largestIntWord = fromIntegral @Int @Word64 largestInt
 
-nap :: MicroSeconds -> IO ()
-nap (MicroSeconds x) = threadDelay x
+nap :: Microseconds -> IO ()
+nap (Microseconds x) = threadDelay x
 
-getCurrentTime :: IO NanoSeconds
+getCurrentTime :: IO Nanoseconds
 getCurrentTime = coerce getMonotonicTimeNSec
+
+-- $introduction
+-- A resource pool that uses minimal cpu under high contention.
+--
+-- There are two parameters to configure:
+--
+-- 1. The largest number of resources that might be acquired but not
+-- yet released
+--
+-- 2. The amount of time that an acquired resource can go unused
+-- before it is released
