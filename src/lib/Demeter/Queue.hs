@@ -75,6 +75,8 @@ removeSelf tv prevPP prevP nextP = do
   case next of
     TNil -> writeTVar tv prevP
     TCons bp _ _ -> writeTVar bp prevP
+  -- point the back pointer to the forward pointer as a sign that
+  -- the cell has been popped (referenced in maybeRemoveSelf)
   writeTVar prevPP nextP
 {-# INLINE removeSelf #-}
 
