@@ -45,7 +45,7 @@ newTDQueueIO = do
   pure (TDQueue emptyVarL emptyVarR)
 {-# INLINEABLE newTDQueueIO #-}
 
-removeSelf ::
+maybeRemoveSelf ::
   -- | 'TDQueue's final foward pointer pointer
   TVar (TVar (TDList a)) ->
   -- | Our back pointer
@@ -53,19 +53,31 @@ removeSelf ::
   -- | Our forward pointter
   TVar (TDList a) ->
   STM ()
-removeSelf tv prevPP nextP = do
+maybeRemoveSelf tv prevPP nextP = do
   prevP <- readTVar prevPP
   -- If our back pointer points to our forward pointer then we have
   -- already been removed from the queue
   case prevP == nextP of
     True -> pure ()
-    False -> do
-      next <- readTVar nextP
-      writeTVar prevP next
-      case next of
-        TNil -> writeTVar tv prevP
-        TCons bp _ _ -> writeTVar bp prevP
-      writeTVar prevPP nextP
+    False -> removeSelf tv prevPP prevP nextP
+{-# INLINE maybeRemoveSelf #-}
+
+-- Like maybeRemoveSelf, but doesn't check whether or not we have already been removed.
+removeSelf ::
+  TVar (TVar (TDList a)) ->
+  TVar (TVar (TDList a)) ->
+  TVar (TDList a) ->
+  TVar (TDList a) ->
+  STM ()
+removeSelf tv prevPP prevP nextP = do
+  next <- readTVar nextP
+  writeTVar prevP next
+  case next of
+    TNil -> writeTVar tv prevP
+    TCons bp _ _ -> writeTVar bp prevP
+  -- point the back pointer to the forward pointer as a sign that
+  -- the cell has been popped (referenced in maybeRemoveSelf)
+  writeTVar prevPP nextP
 {-# INLINE removeSelf #-}
 
 -- | Returns an STM action that removes the pushed element from the
@@ -78,7 +90,7 @@ push (TDQueue _ tv) a = do
   let cell = TCons backPointer a emptyVar
   writeTVar fwdPointer cell
   writeTVar tv emptyVar
-  pure (removeSelf tv backPointer emptyVar)
+  pure (maybeRemoveSelf tv backPointer emptyVar)
 {-# INLINE push #-}
 
 pop :: TDQueue a -> STM (Maybe a)
@@ -86,14 +98,7 @@ pop (TDQueue hv tv) = do
   readTVar hv >>= \case
     TNil -> pure Nothing
     TCons bp a fp -> do
-      f <- readTVar fp
-      writeTVar hv f
-      case f of
-        TNil -> writeTVar tv hv
-        TCons fbp _ _ -> writeTVar fbp hv
-      -- point the back pointer to the forward pointer as a sign that
-      -- the cell has been popped (referenced in removeSelf)
-      writeTVar bp fp
+      removeSelf tv bp hv fp
       pure (Just a)
 {-# INLINE pop #-}
 
