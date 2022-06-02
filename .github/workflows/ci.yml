@@ -9,8 +9,8 @@ jobs:
       matrix:
         include:
           - compiler: ghc8107
-          - compiler: ghc901
-          - compiler: ghc921
+          - compiler: ghc902
+          - compiler: ghc922
     steps:
     - uses: actions/checkout@v2.4.0
     - uses: cachix/install-nix-action@v15

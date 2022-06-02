@@ -3,7 +3,7 @@
 
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-21.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-22.05";
     flake-compat = {
       url = "github:edolstra/flake-compat";
       flake = false;
@@ -48,7 +48,7 @@
           };
 
           defaultPackage = ghc.demeter;
-          checks = pkgs.lib.attrsets.genAttrs [ "ghc8107" "ghc901" "ghc921" ]
+          checks = pkgs.lib.attrsets.genAttrs [ "ghc8107" "ghc902" "ghc922" ]
             (ghc-ver: pkgs.haskell.packages."${ghc-ver}".demeter);
         });
       topLevelAttrs = {
