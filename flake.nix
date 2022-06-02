@@ -37,8 +37,8 @@
             packages = hpkgs:
               with hpkgs;
               with pkgs.haskell.lib; [
-                (doCheck demeter)
-                (doCheck demeter-queue)
+                demeter
+                demeter-queue
               ];
           };
 
