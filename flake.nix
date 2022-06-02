@@ -36,11 +36,16 @@
             nativeBuildInputs = with pkgs; [ cabal-install ];
             packages = hpkgs:
               with hpkgs;
-              with pkgs.haskell.lib;
-              [ (doCheck demeter) ];
+              with pkgs.haskell.lib; [
+                (doCheck demeter)
+                (doCheck demeter-queue)
+              ];
           };
 
-          packages = { demeter = ghc.demeter; };
+          packages = {
+            demeter = ghc.demeter;
+            demeter-queue = ghc.demeter-queue;
+          };
 
           defaultPackage = ghc.demeter;
           checks = pkgs.lib.attrsets.genAttrs [ "ghc8107" "ghc901" "ghc921" ]
@@ -73,8 +78,12 @@
                         in src';
                     in {
                       demeter = let
-                        p =
-                          self.callCabal2nix "demeter" (cleanSource ./src) { };
+                        p = self.callCabal2nix "demeter"
+                          (cleanSource ./src/demeter) { };
+                      in p;
+                      demeter-queue = let
+                        p = self.callCabal2nix "demeter-queue"
+                          (cleanSource ./src/demeter-queue) { };
                       in p;
                     });
               in prev.haskell.packages // patchedGhcs;
