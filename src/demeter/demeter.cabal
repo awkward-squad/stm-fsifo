@@ -12,15 +12,16 @@ license: BSD-3-Clause
 maintainer: Travis Staton <hello@travisstaton.com>, Mitchell Rosen <mitchellwrosen@gmail.com>
 synopsis: A high-performance pooling abstraction
 description:
-        A high-performance resource pool that performs well under many
-        conditions including a starved pool with many waiting threads.
+
+        A resource pool that performs well under many conditions
+        including a starved pool with many waiting threads.
 
 library
     exposed-modules: Demeter
 
     build-depends:
       base >= 4.14 && < 5,
-      demeter-queue ^>= 0.1,
+      stm-fsifo ^>= 0.1,
       stm ^>= 2.5,
 
     hs-source-dirs:   lib

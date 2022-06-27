@@ -8,12 +8,12 @@
 module Main where
 
 import Control.Concurrent.STM
+import qualified Control.Concurrent.STM.Fsifo as Fsifo
 import Control.Monad.IO.Class
 import Data.IntMap (IntMap)
 import qualified Data.IntMap.Strict as IM
 import Data.Kind
 import Data.Maybe
-import qualified Demeter.Queue as Demeter
 import Hedgehog
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
@@ -33,7 +33,7 @@ main =
 
 prop_queue :: Property
 prop_queue = property do
-  qvar <- liftIO $ newTVarIO =<< Demeter.newTDQueueIO
+  qvar <- liftIO $ newTVarIO =<< Fsifo.newFsifoIO
   actions <-
     forAll $
       Gen.sequential
@@ -56,7 +56,7 @@ prop_queue = property do
         }
 
     resetQ qvar = atomically do
-      q <- Demeter.newTDQueue
+      q <- Fsifo.newFsifo
       writeTVar qvar q
 
     s_push qvar =
@@ -69,7 +69,7 @@ prop_queue = property do
               <$> liftIO
                 ( atomically do
                     q <- readTVar qvar
-                    Demeter.push q n
+                    Fsifo.push q n
                 )
           upd = Update \(QueueModel s pushCount im _) (Push i) out ->
             let !pushCount' = pushCount + 1
@@ -87,7 +87,7 @@ prop_queue = property do
           execute Pop = do
             liftIO $ atomically do
               q <- readTVar qvar
-              Demeter.pop q
+              Fsifo.pop q
           upd = Update \(QueueModel s pushCount im _) Pop _out ->
             let mk = fst <$> IM.lookupGE minBound s
                 s' = maybe s (\k -> IM.delete k s) mk
@@ -118,7 +118,7 @@ prop_queue = property do
               True -> Nothing
               False -> Just (pure Check)
           execute Check = do
-            liftIO (atomically $ Demeter.toList =<< readTVar qvar)
+            liftIO (atomically $ Fsifo.toList =<< readTVar qvar)
           upd = Update \(QueueModel im s pushCount _) Check _ ->
             QueueModel im s pushCount True
           postcond = Ensure \_ QueueModel {..} Check xs ->

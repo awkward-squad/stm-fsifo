@@ -1,5 +1,5 @@
 cabal-version:      2.4
-name:               demeter-queue
+name:               stm-fsifo
 version:            0.1.0.0
 
 author: Travis Staton <hello@travisstaton.com>
@@ -12,11 +12,13 @@ license: BSD-3-Clause
 maintainer: Travis Staton <hello@travisstaton.com>, Mitchell Rosen <mitchellwrosen@gmail.com>
 synopsis: A high-performance pooling abstraction
 description:
-        A high-performance resource pool that performs well under many
-        conditions including a starved pool with many waiting threads.
+
+        @stm-fsifo@ (first still in first out) is a FIFO queue that
+        supports /O(1)/ push, pop, and removing any element from the
+        queue.
 
 library
-    exposed-modules: Demeter.Queue
+    exposed-modules: Control.Concurrent.STM.Fsifo
     build-depends:
       base >= 4.14 && < 5,
       stm ^>= 2.5,
@@ -37,7 +39,7 @@ test-suite test
   main-is: Main.hs
   build-depends:
     base,
-    demeter-queue,
+    stm-fsifo,
     stm,
     tasty ^>= 1.4,
     tasty-hedgehog ^>= 1.1 || ^>= 1.2,

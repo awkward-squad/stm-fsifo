@@ -11,8 +11,8 @@
 
 module Demeter
   ( -- $introduction
-    Pool,
     withPool,
+    Pool,
     withResource,
     Milliseconds (..),
 
@@ -24,17 +24,17 @@ where
 
 import Control.Concurrent
 import Control.Concurrent.STM
+import Control.Concurrent.STM.Fsifo
 import Control.Exception
 import Control.Monad
 import Data.Coerce (coerce)
 import Data.Foldable (traverse_)
 import Data.Word (Word64)
-import Demeter.Queue
 import GHC.Clock (getMonotonicTimeNSec)
 
 data Pool a = Pool
   { availableResources :: {-# UNPACK #-} !(TVar [PoolEntry a]),
-    awaitingResources :: {-# UNPACK #-} !(TDQueue (TMVar (ResourceNotification a))),
+    awaitingResources :: {-# UNPACK #-} !(Fsifo (TMVar (ResourceNotification a))),
     createdResourceCount :: {-# UNPACK #-} !(TVar Int),
     maxResourceCount :: {-# UNPACK #-} !Int,
     resourceExpiry :: {-# UNPACK #-} !Nanoseconds,
@@ -68,7 +68,7 @@ createPool ::
 createPool acquire release mx expiry = do
   let expiryNs = ms2ns expiry
   resourceVar <- newTVarIO []
-  waiterVar <- newTDQueueIO
+  waiterVar <- newFsifoIO
   resourceCount <- newTVarIO 0
   reaperThread <- forkReaper expiryNs waiterVar resourceVar resourceCount release
   let pool =
@@ -134,14 +134,14 @@ instance Exception UnexpectedReaperException where
 -- the release of other expired resources, the reaper does not release
 -- any resources itself, but sends each batch of releases to a child
 -- thread for releasing. These children threads are kept track of in a
--- 'TDQueue'.
+-- 'Fsifo'.
 --
 -- When the reaper is killed it waits for the children to finish
 -- releasing the resources it had already checked out, but if a second
 -- exception is received then it kills all children and signals completion.
 forkReaper ::
   Nanoseconds ->
-  TDQueue (TMVar (ResourceNotification a)) ->
+  Fsifo (TMVar (ResourceNotification a)) ->
   TVar [PoolEntry a] ->
   TVar Int ->
   (a -> IO ()) ->
@@ -209,7 +209,7 @@ returnResourceSTM Pool {..} c = returnResourceSTM' awaitingResources availableRe
 {-# INLINE returnResourceSTM #-}
 
 returnResourceSTM' ::
-  TDQueue (TMVar (ResourceNotification a)) ->
+  Fsifo (TMVar (ResourceNotification a)) ->
   TVar [PoolEntry a] ->
   TVar Int ->
   ResourceNotification a ->
@@ -244,7 +244,7 @@ destroyResource Pool {..} c = do
 
 destroyResource' ::
   (a -> IO ()) ->
-  TDQueue (TMVar (ResourceNotification a)) ->
+  Fsifo (TMVar (ResourceNotification a)) ->
   TVar [PoolEntry a] ->
   TVar Int ->
   a ->
@@ -320,7 +320,7 @@ getCurrentTime :: IO Nanoseconds
 getCurrentTime = coerce getMonotonicTimeNSec
 
 -- $introduction
--- A resource pool that uses minimal cpu under high contention.
+-- A high-performance resource pool.
 --
 -- There are two parameters to configure:
 --

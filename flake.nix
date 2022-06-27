@@ -1,5 +1,5 @@
 {
-  description = "Haskell resource pool";
+  description = "Demeter";
 
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";
@@ -38,13 +38,13 @@
               with hpkgs;
               with pkgs.haskell.lib; [
                 demeter
-                demeter-queue
+                stm-fsifo
               ];
           };
 
           packages = {
             demeter = ghc.demeter;
-            demeter-queue = ghc.demeter-queue;
+            stm-fsifo = ghc.stm-fsifo;
           };
 
           defaultPackage = ghc.demeter;
@@ -81,9 +81,9 @@
                         p = self.callCabal2nix "demeter"
                           (cleanSource ./src/demeter) { };
                       in p;
-                      demeter-queue = let
-                        p = self.callCabal2nix "demeter-queue"
-                          (cleanSource ./src/demeter-queue) { };
+                      stm-fsifo = let
+                        p = self.callCabal2nix "stm-fsifo"
+                          (cleanSource ./src/stm-fsifo) { };
                       in p;
                     });
               in prev.haskell.packages // patchedGhcs;

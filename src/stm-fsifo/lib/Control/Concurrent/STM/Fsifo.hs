@@ -1,9 +1,9 @@
 {-# LANGUAGE LambdaCase #-}
 
-module Demeter.Queue
-  ( TDQueue (..),
-    newTDQueue,
-    newTDQueueIO,
+module Control.Concurrent.STM.Fsifo
+  ( Fsifo,
+    newFsifo,
+    newFsifoIO,
     push,
     pop,
     toList,
@@ -12,17 +12,20 @@ where
 
 import Control.Concurrent.STM
 
--- | A FIFO queue that supports removing any element from the queue.
+-- | A FIFO queue that supports /O(1)/ push, pop, and removing any
+-- element from the queue.
 --
--- We have a pointer to the head of the list, and also a pointer to
--- the final foward pointer in the list.
-data TDQueue a
-  = TDQueue
+-- This is similar to a double-ended doubly-linked queue, but employs
+-- a few simplifications afforded by the limited interface.
+data Fsifo a
+  = Fsifo
       {-# UNPACK #-} !(TVar (TDList a))
+      -- ^ The head of the list
       {-# UNPACK #-} !(TVar (TVar (TDList a)))
+      -- ^ Pointer to the final forward pointer in the list
 
 -- | Each element has a pointer to the previous element's forward
--- pointer where "previous element" can be a 'TDList' or the 'TDQueue'
+-- pointer where "previous element" can be a 'TDList' or the 'Fsifo'
 -- head pointer.
 data TDList a
   = TCons
@@ -31,22 +34,22 @@ data TDList a
       {-# UNPACK #-} !(TVar (TDList a))
   | TNil
 
-newTDQueue :: STM (TDQueue a)
-newTDQueue = do
+newFsifo :: STM (Fsifo a)
+newFsifo = do
   emptyVarL <- newTVar TNil
   emptyVarR <- newTVar emptyVarL
-  pure (TDQueue emptyVarL emptyVarR)
-{-# INLINEABLE newTDQueue #-}
+  pure (Fsifo emptyVarL emptyVarR)
+{-# INLINEABLE newFsifo #-}
 
-newTDQueueIO :: IO (TDQueue a)
-newTDQueueIO = do
+newFsifoIO :: IO (Fsifo a)
+newFsifoIO = do
   emptyVarL <- newTVarIO TNil
   emptyVarR <- newTVarIO emptyVarL
-  pure (TDQueue emptyVarL emptyVarR)
-{-# INLINEABLE newTDQueueIO #-}
+  pure (Fsifo emptyVarL emptyVarR)
+{-# INLINEABLE newFsifoIO #-}
 
 maybeRemoveSelf ::
-  -- | 'TDQueue's final foward pointer pointer
+  -- | 'Fsifo's final foward pointer pointer
   TVar (TVar (TDList a)) ->
   -- | Our back pointer
   TVar (TVar (TDList a)) ->
@@ -62,7 +65,8 @@ maybeRemoveSelf tv prevPP nextP = do
     False -> removeSelf tv prevPP prevP nextP
 {-# INLINE maybeRemoveSelf #-}
 
--- Like maybeRemoveSelf, but doesn't check whether or not we have already been removed.
+-- Like maybeRemoveSelf, but doesn't check whether or not we have
+-- already been removed.
 removeSelf ::
   TVar (TVar (TDList a)) ->
   TVar (TVar (TDList a)) ->
@@ -80,10 +84,11 @@ removeSelf tv prevPP prevP nextP = do
   writeTVar prevPP nextP
 {-# INLINE removeSelf #-}
 
--- | Returns an STM action that removes the pushed element from the
--- queue
-push :: TDQueue a -> a -> STM (STM ())
-push (TDQueue _ tv) a = do
+-- | Push an element onto the back of the queue.
+--
+-- Returns an STM action that removes this element from the queue.
+push :: Fsifo a -> a -> STM (STM ())
+push (Fsifo _ tv) a = do
   fwdPointer <- readTVar tv
   backPointer <- newTVar fwdPointer
   emptyVar <- newTVar TNil
@@ -91,19 +96,23 @@ push (TDQueue _ tv) a = do
   writeTVar fwdPointer cell
   writeTVar tv emptyVar
   pure (maybeRemoveSelf tv backPointer emptyVar)
-{-# INLINE push #-}
+{-# INLINEABLE push #-}
 
-pop :: TDQueue a -> STM (Maybe a)
-pop (TDQueue hv tv) = do
+-- | Pop an element from the front of the queue.
+pop :: Fsifo a -> STM (Maybe a)
+pop (Fsifo hv tv) = do
   readTVar hv >>= \case
     TNil -> pure Nothing
     TCons bp a fp -> do
       removeSelf tv bp hv fp
       pure (Just a)
-{-# INLINE pop #-}
+{-# INLINEABLE pop #-}
 
-toList :: TDQueue a -> STM [a]
-toList (TDQueue hv _) =
+-- | Produce a list of the queue's elements.
+--
+-- This does not remove any elements from the queue.
+toList :: Fsifo a -> STM [a]
+toList (Fsifo hv _) =
   let go xs v = do
         readTVar v >>= \case
           TNil -> pure (reverse xs)
