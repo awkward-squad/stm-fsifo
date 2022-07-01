@@ -13,8 +13,162 @@ maintainer: Travis Staton <hello@travisstaton.com>, Mitchell Rosen <mitchellwros
 synopsis: A high-performance pooling abstraction
 description:
 
-        A resource pool that performs well under many conditions
-        including a starved pool with many waiting threads.
+  = Introduction
+
+  .
+
+  A resource pool that performs well under many conditions including
+
+  .
+
+    * high contention
+    * burst contention
+    * light usage
+    * burst followed by light usage
+    * starved
+
+  .
+
+  A resource pool manages the lifecycle and distribution of resources
+  across multiple threads, where a "resource" is anything that once
+  acquired must be released. An example of a resource is a PostgreSQL
+  connection.
+
+  .
+
+  A resource is assumed to be either expensive to acquire or expensive
+  to release. For example, the resource may contain a cache that, over
+  time, becomes more and more costly to rebuild if thrown away. 
+
+  .
+
+  Additionally, it is assumed that there is some upper limit to the
+  number of live resources (/i.e./ acquired but not yet released). For
+  example, the PostgreSQL server handles each client connection by
+  forking a new OS process. Depending on the hardware available,
+  performance might begin to degrade if there are over 100 live
+  connections.
+
+  .
+
+  +------------------------+------------+----------+----------+
+  | Header row, column 1   | Header 2   | Header 3 | Header 4 |
+  | (header rows optional) |            |          |          |
+  +========================+============+==========+==========+
+  | body row 1, column 1   | column 2   | column 3 | column 4 |
+  +------------------------+------------+----------+----------+
+  | body row 2             | Cells may span columns.          |
+  +------------------------+------------+---------------------+
+  | body row 3             | Cells may  | \[                  |
+  +------------------------+ span rows. | f(n) = \sum_{i=1}   |
+  | body row 4             |            | \]                  |
+  +------------------------+------------+---------------------+
+
+  .
+
+  = Internal Details
+
+  .
+
+  Internally, there are two queues in place: There is a LIFO queue of
+  idle resources and a FIFO queue of /waiters/. A waiter is a thread
+  that requests a resource but the pool is unable to supply it before
+  another thread returns a resource. Thus, the requesting thread must
+  wait for some thread to return a resource to the pool.
+
+  .
+
+  === The LIFO queue of idle resources
+
+  .
+
+  The queue of idle resources is LIFO to allow for releasing
+  unnecessary resources during periods of low activity.
+
+  .
+
+  To see how LIFO achieves this: suppose there is a pool of database
+  connections with a limit of 10 resources and a TTL of 10
+  seconds. Suppose further that there is a burst of activity that
+  causes 10 database connections to be acquired, followed by "low
+  activity period" of one request per second that takes two
+  milliseconds to complete. A FIFO queue of idle resources would cause
+  each resource to be used during 10 seconds of this "low activity
+  period", thus all 10 connections would be kept alive.
+
+  .
+
+  This is unnecessary &#8212; all of the "low activity period"
+  requests could be handled by a single database connection with no
+  contention. A LIFO queue allows this trickle of requests to be
+  handled by the same connection, and the resource count falls to a
+  single connection as desired.
+
+  .
+
+  === The FIFO queue of waiters
+
+  .
+
+  The FIFO queue of waiters is populated when a resource is requested
+  but there are no idle resources and the resource limit has been
+  reached. In this case, the requesting thread places a @TMVar@ in the
+  FIFO queue and blocks on that @TMVar@, waiting for some thread to
+  return a resource to it.
+
+  .
+
+  When a thread must block and wait for some other thread to return a
+  resource then there are two important concerns:
+
+  .
+
+  1. Fair distribution of resources
+  2. Good performance under high contention
+
+  .
+
+  ==== How @MVar@s work
+
+  @MVar@s are implemented by pointer to a value and a queue that can
+  hold either waiting putters or waiting takers. When taking an @MVar@
+  a spinlock is first acquired that guards access to the queue and
+  value. Then, if the pointer is non-null, it is copied out and set to
+  null and the lock is released. If the pointer is null then the
+  thread adds itself to the taker queue, releases the lock, and goes
+  to sleep.
+
+  .
+
+  When putting to an @MVar@ the spinlock is acquired. If the pointer
+  is null then it is set to the provided value and the lock is
+  released. Otherwise, the value is non-null and the queue so the
+  thread adds itself to the queue of pushers, releases the lock, and
+  goes to sleep.
+
+  .
+
+  @STM@ not only helps by providing serializable transactions, but it
+  also helps achieve (2) over @MVars@. This is because an @MVar@ would
+  put threads to sleep more often than necessary: If concurrent access
+  of a variable happens with @MVars@ then the second variable to
+  access the @MVar@ observes that it is taken, adds itself to the
+  @MVars@ queue, and goes to sleep. If concurrent access of a variable
+  happens with @STM@ then the second thread that attempts to validate
+  its transaction fails and /immediately retries the transaction/.
+
+  .
+
+  This is useful spinning! It is undesirable that two threads
+  concurrently returning a resource would result in one of them going
+  to sleep and having to be woken up by the RTS later. The same is
+  true for two threads taking resources when there are plenty
+  available, or a thread taking an available resource getting stopped
+  by a thread returning a resource.
+
+  .
+
+  Using @STM@ raises another potential problem though: When a 
 
 library
     exposed-modules: Demeter

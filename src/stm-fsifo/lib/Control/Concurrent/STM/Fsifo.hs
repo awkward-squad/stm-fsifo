@@ -6,23 +6,26 @@ module Control.Concurrent.STM.Fsifo
     newFsifoIO,
     push,
     pop,
-    toList,
   )
 where
 
 import Control.Concurrent.STM
+import Data.Functor
 
--- | A FIFO queue that supports /O(1)/ push, pop, and removing any
--- element from the queue.
+-- | A first-/still/-in-first-out queue that supports
 --
--- This is similar to a double-ended doubly-linked queue, but employs
--- a few simplifications afforded by the limited interface.
+--   * \( O(1) \) push
+--   * \( O(1) \) pop
+--   * \( O(1) \) delete
 data Fsifo a
   = Fsifo
       {-# UNPACK #-} !(TVar (TDList a))
       -- ^ The head of the list
       {-# UNPACK #-} !(TVar (TVar (TDList a)))
       -- ^ Pointer to the final forward pointer in the list
+
+-- This is similar to a double-ended doubly-linked queue, but employs
+-- a few simplifications afforded by the limited interface.
 
 -- | Each element has a pointer to the previous element's forward
 -- pointer where "previous element" can be a 'TDList' or the 'Fsifo'
@@ -34,6 +37,7 @@ data TDList a
       {-# UNPACK #-} !(TVar (TDList a))
   | TNil
 
+-- | Create a @Fsifo@
 newFsifo :: STM (Fsifo a)
 newFsifo = do
   emptyVarL <- newTVar TNil
@@ -41,6 +45,7 @@ newFsifo = do
   pure (Fsifo emptyVarL emptyVarR)
 {-# INLINEABLE newFsifo #-}
 
+-- | Create a @Fsifo@ in @IO@
 newFsifoIO :: IO (Fsifo a)
 newFsifoIO = do
   emptyVarL <- newTVarIO TNil
@@ -55,14 +60,14 @@ maybeRemoveSelf ::
   TVar (TVar (TDList a)) ->
   -- | Our forward pointter
   TVar (TDList a) ->
-  STM ()
+  STM Bool
 maybeRemoveSelf tv prevPP nextP = do
   prevP <- readTVar prevPP
   -- If our back pointer points to our forward pointer then we have
   -- already been removed from the queue
   case prevP == nextP of
-    True -> pure ()
-    False -> removeSelf tv prevPP prevP nextP
+    True -> pure False
+    False -> removeSelf tv prevPP prevP nextP $> True
 {-# INLINE maybeRemoveSelf #-}
 
 -- Like maybeRemoveSelf, but doesn't check whether or not we have
@@ -84,10 +89,17 @@ removeSelf tv prevPP prevP nextP = do
   writeTVar prevPP nextP
 {-# INLINE removeSelf #-}
 
--- | Push an element onto the back of the queue.
+-- | Push an element onto a queue.
 --
--- Returns an STM action that removes this element from the queue.
-push :: Fsifo a -> a -> STM (STM ())
+-- @push@ returns an action that attempts to remove the element from
+-- the queue.
+--
+-- The action returns:
+--
+-- * @True@ if the element was removed from the queue
+--
+-- * @False@ if the element was discovered to be no longer in the queue
+push :: Fsifo a -> a -> STM (STM Bool)
 push (Fsifo _ tv) a = do
   fwdPointer <- readTVar tv
   backPointer <- newTVar fwdPointer
@@ -98,7 +110,7 @@ push (Fsifo _ tv) a = do
   pure (maybeRemoveSelf tv backPointer emptyVar)
 {-# INLINEABLE push #-}
 
--- | Pop an element from the front of the queue.
+-- | Pop an element from a queue.
 pop :: Fsifo a -> STM (Maybe a)
 pop (Fsifo hv tv) = do
   readTVar hv >>= \case
@@ -107,15 +119,3 @@ pop (Fsifo hv tv) = do
       removeSelf tv bp hv fp
       pure (Just a)
 {-# INLINEABLE pop #-}
-
--- | Produce a list of the queue's elements.
---
--- This does not remove any elements from the queue.
-toList :: Fsifo a -> STM [a]
-toList (Fsifo hv _) =
-  let go xs v = do
-        readTVar v >>= \case
-          TNil -> pure (reverse xs)
-          TCons _ x np -> go (x : xs) np
-   in go [] hv
-{-# INLINEABLE toList #-}

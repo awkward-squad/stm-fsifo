@@ -19,6 +19,7 @@ import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Test.Tasty
 import Test.Tasty.Hedgehog
+import Unsafe.Coerce (unsafeCoerce)
 
 main :: IO ()
 main =
@@ -37,7 +38,7 @@ prop_queue = property do
   actions <-
     forAll $
       Gen.sequential
-        (Range.linear 1 100)
+        (Range.linear 1 10000)
         initialState
         [ s_push qvar,
           s_check qvar,
@@ -106,7 +107,7 @@ prop_queue = property do
                 pure (RemoveSelf i (fromJust (IM.lookup i removeSelfMap)))
               False -> Nothing
           execute (RemoveSelf _ (Var (Concrete (DeleteFromQueue stm)))) = do
-            liftIO (atomically stm)
+            liftIO (print =<< atomically stm)
           upd = Update \(QueueModel s pushCount im _) (RemoveSelf i _) _ ->
             QueueModel (IM.delete i s) pushCount im False
           preCond = Require \QueueModel {..} _ -> isChecked
@@ -118,7 +119,7 @@ prop_queue = property do
               True -> Nothing
               False -> Just (pure Check)
           execute Check = do
-            liftIO (atomically $ Fsifo.toList =<< readTVar qvar)
+            liftIO (atomically $ peekAll =<< readTVar qvar)
           upd = Update \(QueueModel im s pushCount _) Check _ ->
             QueueModel im s pushCount True
           postcond = Ensure \_ QueueModel {..} Check xs ->
@@ -128,7 +129,7 @@ prop_queue = property do
 
 -- A newtype for our STM delete action since a Show instance is
 -- required for outputs
-newtype DeleteFromQueue = DeleteFromQueue (STM ())
+newtype DeleteFromQueue = DeleteFromQueue (STM Bool)
 
 instance Show DeleteFromQueue where
   show _ = "<stm>"
@@ -175,3 +176,31 @@ data RemoveSelf (v :: Type -> Type) = RemoveSelf Int (Var DeleteFromQueue v)
 
 instance HTraversable RemoveSelf where
   htraverse eta (RemoveSelf x v) = RemoveSelf x <$> htraverse eta v
+
+peekAll :: Fsifo.Fsifo a -> STM [a]
+peekAll = toList . unsafeCoerce
+
+toList :: Q a -> STM [a]
+toList (Q hv _) =
+  let go xs v = do
+        readTVar v >>= \case
+          TNil -> pure (reverse xs)
+          TCons _ x np -> go (x : xs) np
+   in go [] hv
+
+data Q a
+  = Q
+      {-# UNPACK #-} !(TVar (TDList a))
+      -- ^ The head of the list
+      {-# UNPACK #-} !(TVar (TVar (TDList a)))
+      -- ^ Pointer to the final forward pointer in the list
+
+-- | Each element has a pointer to the previous element's forward
+-- pointer where "previous element" can be a 'TDList' or the 'Fsifo'
+-- head pointer.
+data TDList a
+  = TCons
+      {-# UNPACK #-} !(TVar (TVar (TDList a)))
+      a
+      {-# UNPACK #-} !(TVar (TDList a))
+  | TNil

@@ -3,22 +3,172 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
+-- | A resource pool manages the lifecycle and distribution of
+-- resources across multiple threads, where a "resource" is anything
+-- that must be released once acquired. A PostgreSQL connection is an
+-- example of a resource.
+--
+-- == Demeter balances the following constraints:
+--
+-- === It is desirable to minimize the number of acquire or release calls
+--
+-- For example, acquiring a PostgreSQL connection requires
+-- establishing a network connection to the PostgreSQL server and
+-- going through an authorization handshake.
+--
+-- It might also be the case that acquiring a resource is cheap but
+-- releasing a resource is expensive &#8212; for example, SQLite
+-- connections contain a page cache that becomes more and more costly
+-- to rebuild if thrown away.
+--
+-- === It is desirable to limit the number of live resources
+--
+-- For example, the PostgreSQL server has a (configurable) maximum
+-- number of concurrent connections (some shared memory is allocated
+-- when the server starts for each potential connection).
+--
+-- === It is undesirable to keep more live resources than necessary
+--
+-- For example, PostgreSQL server performance degrades as the number
+-- of open connections increases.
+--
+-- == __How Demeter works:__
+--
+-- To alleviate the cost of acquiring and releasing resources, it
+-- would be good to reuse them. However, it is undesirable to keep
+-- acquired resources around for reuse if they aren't necessary.
+--
+-- To balance these conflicting concerns, after a resource is acquired
+-- and returned to the pool it is not released immediately &#8212; it
+-- is instead stored in a LIFO queue of /available resources/ so that
+-- it can be provided to future resource requests. If the resource
+-- goes unused for some configurable amount of time, it will be
+-- automatically released.
+--
+-- The available resource queue is LIFO (rather than FIFO) so that a
+-- traffic burst followed by consistent but infrequent requests does
+-- not keep alive more resources than necessary. Suppose, for example,
+-- that there is a resource limit of 10 and an expiration time of 10
+-- seconds. A burst of requests happens that causes all 10 resources
+-- to be acquired, then there is a lighter workload of one resource
+-- request per 500ms, where each request returns the resource 100ms
+-- after taking it. This "lighter workload" period can clearly be
+-- handled by a single connection, but a FIFO queue would result in
+-- each resource getting used before expiring. On the other hand, a
+-- LIFO queue ensures that the same resource is used for each request,
+-- allowing the 9 unused resources to reach their expiration time and
+-- be released.
+--
+-- The flow for acquiring a resource is:
+--
+--   * If a resource is available then use it, otherwise:
+--
+--       * If the resource limit has not been reached then acquire a new resource and use it, otherwise:
+--
+--           * Block and wait for a resource to be returned to the pool or destroyed
+--
+-- @STM@ is used, for both ease of enforcing serializability /and for performance/.
+-- If the available resources were protected by an
+-- @MVar@ then threads would be removed from the run queue when it
+-- would be preferable that they simply try again immediately. For
+-- example, suppose there are two concurrent threads returning
+-- resources to the pool, @T1@ and @T2@. @T1@ takes the @MVar@ lock in
+-- order to push onto the LIFO, then @T2@ blocks on taking the @MVar@
+-- and goes to sleep (/i.e./ adds itself to the @MVar@'s queue and
+-- removes itself from the run queue). When the @T1@ puts it will
+-- attempt to wake up @T2@ (/i.e./ send a message to @T2@'s capability
+-- that @T2@ can be pushed onto the back of its run queue).
+--
+-- This is a (relatively) large delay that could result in a number of
+-- resource requests blocking because resources aren't being returned
+-- as promptly as they ought to be. A similar situation arises when
+-- @N@ threads concurrently take from an available resources LIFO that
+-- contains at least @N@ resources. None of the threads benefit from
+-- blocking in this scenario. It would be preferable for them to retry
+-- immediately.
+--
+-- @STM@ achieves the desired behavior. Indeed, if @T1@ committed its
+-- transaction first then @T2@ will fail its validation step and
+-- /immediately retry the transaction/, avoiding the expensive process
+-- of going to sleep and being woken up. A thread will only sleep if
+-- there are no available resources, the resource limit is reached,
+-- and the @STM@ validation step succeeds (/i.e./ No thread mutated
+-- these variables since we read them).
+--
+-- @STM@ comes with a significant drawbacks though:
+--
+--   1. When the "available resources" or "number of acquired
+--      resources" variables are mutated then all blocked threads are
+--      signaled that they should be awoken and retry their
+--      transaction. However, the mutation that signals them must be a
+--      single resource being returned or marked as destroyed, so only
+--      one of these awoken threads will actually get the resource and
+--      the rest are just wasting cpu cycles.
+--
+--   2. We lose fair resource distribution: There is no queue of
+--      threads waiting on a resource &#8212; all threads attempt to
+--      grab the resource when signaled that there is a chance they
+--      could get it. Thus, a thread can be delayed from acquiring a
+--      resource on a busy pool for an arbitrarily long time.
+--
+-- It is desirable then to amend the flow so that at most one thread
+-- is awoken when a resource is returned or destroyed, and a thread
+-- does not acquire a resource before prior waiting threads obtain a
+-- resource. To this end, a FIFO queue of /waiters/ is included in
+-- the pool as well. When taking a resource, if the available
+-- resources queue is empty and the resource limit has been reached
+-- then the thread adds a @TMVar@ to the FIFO queue and blocks on
+-- taking from this @TMVar@. When a resource is returned to the pool
+-- then the flow is:
+--
+--   * If the waiter queue is non-empty then return the resource straight to the first waiter, otherwise
+--
+--       * Return the resource to the available resources queue
+--
+-- If a resource is destroyed then the flow is
+--
+--  * If the waiter queue is non-empty then signal the first waiter that it may acquire a resource, otherwise
+--
+--      * Decrement the resource count variable
+--
+-- The only remaining trouble is the threads waiting on a resource
+-- might be thrown an async exception. Thus, the waiter queue ought to
+-- support /O(1)/ delete so that a thread can remove itself from the
+-- queue upon receiving an exception. A queue with this property is
+-- provided by the @stm-fsifo@ package.
+--
+-- With these changes @demeter@ achieves the throughput gains
+-- associated with STM retrying while mitigating the corresponding
+-- drawbacks of retrying transactions too often and unfair resource
+-- distribution.
 module Demeter
-  ( -- $introduction
-    withPool,
+  ( -- * Pool management
     Pool,
-    withResource,
-    Milliseconds (..),
+    withPool,
 
-    -- * Discouraged (but sometimes necessary) alternatives to 'withPool'
+    -- ** Unsafe primitives
+
+    -- | Helpful if the desired usage is incompatible with 'withPool'
+    -- (/e.g./ using
+    -- [Acquire](https://hackage.haskell.org/package/acquire))
     createPool,
     destroyPool,
+
+    -- * Resource management
+    withResource,
+
+    -- ** Unsafe primitives
+    takeResource,
+    returnResource,
+
+    -- * Types
+    Milliseconds (..),
   )
 where
 
@@ -32,6 +182,7 @@ import Data.Foldable (traverse_)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 
+-- | A resource pool
 data Pool a = Pool
   { availableResources :: {-# UNPACK #-} !(TVar [PoolEntry a]),
     awaitingResources :: {-# UNPACK #-} !(Fsifo (TMVar (ResourceNotification a))),
@@ -58,7 +209,6 @@ entryTime (PoolEntry t _) = t
 entryValue :: PoolEntry a -> a
 entryValue (PoolEntry _ a) = a
 
--- | See 'withPool'
 createPool ::
   IO a ->
   (a -> IO ()) ->
@@ -84,7 +234,7 @@ createPool acquire release mx expiry = do
           }
   pure pool
 
--- | Execute an action with a new resource pool.
+-- | Execute an action with a resource pool.
 --
 -- When the callback returns the 'Pool' will be destroyed and all
 -- acquired resources will be released.
@@ -93,10 +243,9 @@ withPool ::
   IO a ->
   -- | How to release a resource
   (a -> IO ()) ->
-  -- | The largest number of resources that might be acquired but not
-  -- yet released
+  -- | The live resource limit (/i.e./ acquired but not yet released)
   Int ->
-  -- | The amount of time that an acquired resource can go unused
+  -- | The amount of time that a resource can remain in the pool
   -- before it is released
   Milliseconds ->
   -- | The action to execute with a new @Pool@
@@ -104,9 +253,8 @@ withPool ::
   IO b
 withPool acquire release mx expiry = bracket (createPool acquire release mx expiry) destroyPool
 
--- | See 'withPool'
 destroyPool :: Pool a -> IO ()
-destroyPool Pool {..} = do
+destroyPool Pool {reaperThread} = do
   let Thread tid doneVar = reaperThread
   uninterruptibleMask_ do
     killThread tid
@@ -205,7 +353,8 @@ forkReaper expiry waiters resourceVar createdResourceCountVar destroyAction = do
   pure (Thread tid resVar)
 
 returnResourceSTM :: Pool a -> ResourceNotification a -> STM ()
-returnResourceSTM Pool {..} c = returnResourceSTM' awaitingResources availableResources createdResourceCount c
+returnResourceSTM Pool {awaitingResources, availableResources, createdResourceCount} c =
+  returnResourceSTM' awaitingResources availableResources createdResourceCount c
 {-# INLINE returnResourceSTM #-}
 
 returnResourceSTM' ::
@@ -223,7 +372,7 @@ returnResourceSTM' awaitingResources availableResources createdResourceCount c =
 {-# INLINE returnResourceSTM' #-}
 
 popAvailable :: Pool a -> STM (Maybe (PoolEntry a))
-popAvailable Pool {..} = do
+popAvailable Pool {availableResources} = do
   readTVar availableResources >>= \case
     [] -> pure Nothing
     x : xs -> do
@@ -231,14 +380,8 @@ popAvailable Pool {..} = do
       pure (Just x)
 {-# INLINE popAvailable #-}
 
-returnResource :: Pool a -> a -> IO ()
-returnResource a b = do
-  ct <- getCurrentTime
-  atomically (returnResourceSTM a (ResourceAvailable (PoolEntry ct b)))
-{-# INLINE returnResource #-}
-
 destroyResource :: Pool a -> a -> IO ()
-destroyResource Pool {..} c = do
+destroyResource Pool {releaseResource, awaitingResources, availableResources, createdResourceCount} c = do
   destroyResource' releaseResource awaitingResources availableResources createdResourceCount c
 {-# INLINE destroyResource #-}
 
@@ -254,36 +397,64 @@ destroyResource' release waiters rs crc r = do
   atomically (returnResourceSTM' waiters rs crc CreationTicket)
 {-# INLINE destroyResource' #-}
 
-withResource :: Pool a -> (a -> IO b) -> IO b
-withResource p@(Pool {..}) k = do
-  let getConn = (join . atomically) do
-        popAvailable p >>= \case
-          Just (PoolEntry _ x) -> pure (pure x)
-          Nothing -> do
-            resourceCount <- readTVar createdResourceCount
-            case resourceCount < maxResourceCount of
-              True -> do
-                writeTVar createdResourceCount $! resourceCount + 1
-                pure (acquireResource `onException` atomically (returnResourceSTM p CreationTicket))
-              False -> do
-                var <- newEmptyTMVar
-                removeSelf <- push awaitingResources var
-                let handleNotif = \case
-                      ResourceAvailable x -> pure (entryValue x)
-                      CreationTicket -> acquireResource `onException` atomically (returnResourceSTM p CreationTicket)
-                    dequeue = atomically do
-                      removeSelf
-                      tryTakeTMVar var >>= \case
-                        Nothing -> pure ()
-                        Just v -> returnResourceSTM p v
-                pure (handleNotif =<< (atomically (takeTMVar var) `onException` dequeue))
-
+-- | Run an action with a resource, then return the resource to the
+-- pool.
+--
+-- === __Details__
+--
+-- If an unused resource is in the pool, then it is used. Otherwise,
+-- if the resource limit is not yet met a resource is created to
+-- provide to the action. Otherwise, block until a resource is
+-- returned.
+--
+-- If an exception is thrown during the execution of the action then
+-- the resource is released.
+--
+-- If no resources are available and the maximum number of live
+-- resources has been reached, then @withResource@ blocks until a
+-- resource is returned.
+withResource ::
+  Pool a ->
+  (a -> IO b) ->
+  IO b
+withResource p k = do
   mask \restore -> do
-    c <- getConn
+    c <- takeResource p
     r <- restore (k c) `onException` destroyResource p c
     returnResource p c
     pure r
 {-# INLINEABLE withResource #-}
+
+takeResource :: Pool a -> IO a
+takeResource p@Pool {createdResourceCount, maxResourceCount, acquireResource, awaitingResources} =
+  (join . atomically) do
+    popAvailable p >>= \case
+      Just (PoolEntry _ x) -> pure (pure x)
+      Nothing -> do
+        resourceCount <- readTVar createdResourceCount
+        case resourceCount < maxResourceCount of
+          True -> do
+            writeTVar createdResourceCount $! resourceCount + 1
+            pure (acquireResource `onException` atomically (returnResourceSTM p CreationTicket))
+          False -> do
+            var <- newEmptyTMVar
+            removeSelf <- push awaitingResources var
+            let handleNotif = \case
+                  ResourceAvailable x -> pure (entryValue x)
+                  CreationTicket -> acquireResource `onException` atomically (returnResourceSTM p CreationTicket)
+                dequeue = atomically do
+                  _ <- removeSelf
+                  tryTakeTMVar var >>= \case
+                    Nothing -> pure ()
+                    Just v -> returnResourceSTM p v
+            pure (handleNotif =<< (atomically (takeTMVar var) `onException` dequeue))
+{-# INLINE takeResource #-}
+
+returnResource :: Pool a -> a -> IO ()
+returnResource a b = do
+  ct <- getCurrentTime
+  atomically (returnResourceSTM a (ResourceAvailable (PoolEntry ct b)))
+{-# INLINE returnResource #-}
 
 newtype Nanoseconds
   = Nanoseconds Word64
@@ -291,7 +462,7 @@ newtype Nanoseconds
 
 newtype Milliseconds
   = Milliseconds Word64
-  deriving newtype (Eq, Ord, Enum)
+  deriving newtype (Eq, Ord)
 
 newtype Microseconds
   = Microseconds Int
@@ -318,14 +489,3 @@ nap (Microseconds x) = threadDelay x
 
 getCurrentTime :: IO Nanoseconds
 getCurrentTime = coerce getMonotonicTimeNSec
-
--- $introduction
--- A high-performance resource pool.
---
--- There are two parameters to configure:
---
--- 1. The largest number of resources that might be acquired but not
--- yet released
---
--- 2. The amount of time that an acquired resource can go unused
--- before it is released
