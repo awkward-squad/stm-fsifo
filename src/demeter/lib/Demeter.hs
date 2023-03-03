@@ -3,11 +3,14 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MagicHash #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE UnboxedTuples #-}
 
 -- | A resource pool manages the lifecycle and distribution of
 -- resources across multiple threads, where a "resource" is anything
@@ -172,7 +175,7 @@ module Demeter
   )
 where
 
-import Control.Concurrent
+import Control.Concurrent hiding (forkIO)
 import Control.Concurrent.STM
 import Control.Concurrent.STM.Fsifo
 import Control.Exception
@@ -181,25 +184,44 @@ import Data.Coerce (coerce)
 import Data.Foldable (traverse_)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
+import GHC.Conc (ThreadId (ThreadId))
+import GHC.Exts (fork#)
+import GHC.IO (IO (IO))
 
 -- | A resource pool
 data Pool a = Pool
-  { availableResources :: {-# UNPACK #-} !(TVar [PoolEntry a]),
+  { -- The resource that have been used and returned to the pool. If they remain here for `resourceExpiry`, then they'll
+    -- be released by the reaper thread. The only way a resource can end up here is if there are no waiters in
+    -- `awaitingResources` at the time it's returned to the pool. The resources are approximately in descending return
+    -- time order: the head of the list contains the resource that was returned most recently, with the greatest (or
+    -- very close to the greatest) `entryTime`.
+    availableResources :: {-# UNPACK #-} !(TVar [PoolEntry a]),
+    -- A queue of waiters. When we go to return a resource to the pool, we'll first try handing it to the first waiter
+    -- in the queue, if any.
     awaitingResources :: {-# UNPACK #-} !(Fsifo (TMVar (ResourceNotification a))),
+    -- The total number of resources we've either created, or have committed to creating. All resources we've committed
+    -- to creating will be in the form of `CreationTicket`s in the `availableResources` list, which allow takers to
+    -- (attempt to) create a resource without bumping this counter again.
     createdResourceCount :: {-# UNPACK #-} !(TVar Int),
+    -- The maximum number of resources that can be created at any given time.
     maxResourceCount :: {-# UNPACK #-} !Int,
+    -- The amount of time a resource can sit in `availableResources` before it is released.
     resourceExpiry :: {-# UNPACK #-} !Nanoseconds,
     acquireResource :: IO a,
     releaseResource :: a -> IO (),
     reaperThread :: {-# UNPACK #-} !(Thread ())
   }
 
+-- A "resource notification" is what one waiting on a resource will receive: either a resource, or permission to create
+-- a new resource.
 data ResourceNotification a
   = ResourceAvailable {-# UNPACK #-} !(PoolEntry a)
-  | CreationTicket
+  | -- Permission to create a new resource
+    CreationTicket
 
 data PoolEntry a
   = PoolEntry
+      -- The monotonic time that this resource was returned to the pool.
       {-# UNPACK #-} !Nanoseconds
       a
 
@@ -266,7 +288,7 @@ data Thread a
 nanoSecondsToSleepTime :: Nanoseconds -> Microseconds
 nanoSecondsToSleepTime w =
   -- don't sleep less than 1 second
-  max 1000000 (ns2td w + 1)
+  max 1_000_000 (ns2td w + 1)
 
 data UnexpectedReaperException
   = UnexpectedReaperException SomeException
@@ -321,7 +343,7 @@ forkReaper expiry waiters resourceVar createdResourceCountVar destroyAction = do
             -- This avoids waking up the reaper if there is no pool
             -- activity or so much activity that resources are
             -- returned straight to waiters.
-            [] -> atomically (guard . not . null =<< readTVar resourceVar) >> action (nanoSecondsToSleepTime expiry)
+            [] -> atomically (guard . not . null =<< readTVar resourceVar) >> action expirySleepTime
             _ -> reapDead >>= action
         reapDead = do
           ct <- getCurrentTime
@@ -330,11 +352,10 @@ forkReaper expiry waiters resourceVar createdResourceCountVar destroyAction = do
             writeTVar resourceVar living
             pure (living, dead)
           reap dead
-          pure $ case living of
+          pure case living of
             [] -> expirySleepTime
-            _ -> nanoSecondsToSleepTime (entryTime $ last living)
-        reap xs = do
-          traverse_ (releaseWithWorker . entryValue) xs
+            _ -> nanoSecondsToSleepTime (entryTime $ last living) -- last living expires first
+        reap = traverse_ (releaseWithWorker . entryValue)
         waitForWorkers = do
           atomically do
             readTVar workerCountVar >>= \case
@@ -342,19 +363,24 @@ forkReaper expiry waiters resourceVar createdResourceCountVar destroyAction = do
               _ -> retry
 
         releaseWithWorker resource = do
-          atomically do
-            modifyTVar' workerCountVar (+ 1)
+          atomically (modifyTVar' workerCountVar (+ 1))
           _tid <- forkIO do
-            unmask (destroyResource' destroyAction waiters resourceVar createdResourceCountVar resource) `catch` \(_ :: SomeException) -> pure ()
-            atomically do
-              modifyTVar' workerCountVar (subtract 1)
+            destroyResource' destroyAction waiters resourceVar createdResourceCountVar resource
+            atomically (modifyTVar' workerCountVar (subtract 1))
           pure ()
-    action (nanoSecondsToSleepTime expiry) `catch` (uninterruptibleMask_ . errHandler)
+    unmask (action expirySleepTime) `catch` (uninterruptibleMask_ . errHandler)
   pure (Thread tid resVar)
 
+-- Return a resource notification to the pool.
+--
+-- If there is a waiter, hand it to them directly.
+--
+-- Otherwise,
+--   If the resource notification is a real resource, add it to the list of available resources.
+--   Otherwise, it's a creation ticket; "return" it by decrementing the created resources count.
 returnResourceSTM :: Pool a -> ResourceNotification a -> STM ()
-returnResourceSTM Pool {awaitingResources, availableResources, createdResourceCount} c =
-  returnResourceSTM' awaitingResources availableResources createdResourceCount c
+returnResourceSTM Pool {awaitingResources, availableResources, createdResourceCount} =
+  returnResourceSTM' awaitingResources availableResources createdResourceCount
 {-# INLINE returnResourceSTM #-}
 
 returnResourceSTM' ::
@@ -363,11 +389,11 @@ returnResourceSTM' ::
   TVar Int ->
   ResourceNotification a ->
   STM ()
-returnResourceSTM' awaitingResources availableResources createdResourceCount c = do
-  pop awaitingResources >>= \case
+returnResourceSTM' awaitingResources availableResources createdResourceCount c =
+  popFsifo awaitingResources >>= \case
     Nothing -> case c of
       ResourceAvailable v -> modifyTVar availableResources (v :)
-      CreationTicket -> modifyTVar' createdResourceCount (\x -> x - 1)
+      CreationTicket -> modifyTVar' createdResourceCount (subtract 1)
     Just w -> putTMVar w c
 {-# INLINE returnResourceSTM' #-}
 
@@ -380,6 +406,14 @@ popAvailable Pool {availableResources} = do
       pure (Just x)
 {-# INLINE popAvailable #-}
 
+-- Destroy a resource by calling its release action (ignoring exceptions), then returning a creation ticket to the pool.
+--
+-- We ignore release action exceptions because there are only two circumstances under which we destroy resources:
+--
+--   - A user callback threw an exception; we consider that exception more important.
+--   - We are destroying the pool, so we don't care about release action exceptions.
+--
+-- This action never throws an exception.
 destroyResource :: Pool a -> a -> IO ()
 destroyResource Pool {releaseResource, awaitingResources, availableResources, createdResourceCount} c = do
   destroyResource' releaseResource awaitingResources availableResources createdResourceCount c
@@ -393,7 +427,7 @@ destroyResource' ::
   a ->
   IO ()
 destroyResource' release waiters rs crc r = do
-  release r `onException` atomically (returnResourceSTM' waiters rs crc CreationTicket)
+  release r `catch` \(_ :: SomeException) -> pure ()
   atomically (returnResourceSTM' waiters rs crc CreationTicket)
 {-# INLINE destroyResource' #-}
 
@@ -429,31 +463,40 @@ takeResource :: Pool a -> IO a
 takeResource p@Pool {createdResourceCount, maxResourceCount, acquireResource, awaitingResources} =
   (join . atomically) do
     popAvailable p >>= \case
-      Just (PoolEntry _ x) -> pure (pure x)
+      Just entry -> pure (pure (entryValue entry))
       Nothing -> do
         resourceCount <- readTVar createdResourceCount
         case resourceCount < maxResourceCount of
           True -> do
             writeTVar createdResourceCount $! resourceCount + 1
-            pure (acquireResource `onException` atomically (returnResourceSTM p CreationTicket))
+            pure acquire
           False -> do
             var <- newEmptyTMVar
-            removeSelf <- push awaitingResources var
-            let handleNotif = \case
-                  ResourceAvailable x -> pure (entryValue x)
-                  CreationTicket -> acquireResource `onException` atomically (returnResourceSTM p CreationTicket)
-                dequeue = atomically do
-                  _ <- removeSelf
-                  tryTakeTMVar var >>= \case
-                    Nothing -> pure ()
-                    Just v -> returnResourceSTM p v
-            pure (handleNotif =<< (atomically (takeTMVar var) `onException` dequeue))
+            removeSelf <- pushFsifo awaitingResources var
+            pure do
+              notification <-
+                atomically (takeTMVar var) `onException` do
+                  -- We got hit with an async exception while waiting for a resource, so remove ourselves from the
+                  -- waiters queue. If someone happened to give us a resource before we manage to do so, return it to
+                  -- the pool.
+                  atomically do
+                    _ <- removeSelf
+                    tryTakeTMVar var >>= \case
+                      Nothing -> pure ()
+                      Just v -> returnResourceSTM p v
+              case notification of
+                ResourceAvailable x -> pure (entryValue x)
+                CreationTicket -> acquire
+  where
+    -- Attempt to acquire a resource. If that fails, return a creation ticket to the pool, which will allow the next
+    -- taker to try without bumping the `createdResourceCount`.
+    acquire = acquireResource `onException` atomically (returnResourceSTM p CreationTicket)
 {-# INLINE takeResource #-}
 
 returnResource :: Pool a -> a -> IO ()
-returnResource a b = do
+returnResource pool resource = do
   ct <- getCurrentTime
-  atomically (returnResourceSTM a (ResourceAvailable (PoolEntry ct b)))
+  atomically (returnResourceSTM pool (ResourceAvailable (PoolEntry ct resource)))
 {-# INLINE returnResource #-}
 
 newtype Nanoseconds
@@ -470,7 +513,7 @@ newtype Microseconds
 
 ms2ns :: Milliseconds -> Nanoseconds
 ms2ns (Milliseconds x) =
-  let ns = x * 1000000
+  let ns = x * 1_000_000
    in case ns < x of
         True -> Nanoseconds maxBound
         False -> Nanoseconds ns
@@ -489,3 +532,10 @@ nap (Microseconds x) = threadDelay x
 
 getCurrentTime :: IO Nanoseconds
 getCurrentTime = coerce getMonotonicTimeNSec
+
+-- Control.Concurrent.forkIO without the default exception handler
+forkIO :: IO () -> IO ThreadId
+forkIO (IO action) =
+  IO \s0 ->
+    case fork# action s0 of
+      (# s1, tid #) -> (# s1, ThreadId tid #)
