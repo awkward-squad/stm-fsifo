@@ -10,7 +10,7 @@ jobs:
         include:
           - compiler: ghc8107
           - compiler: ghc902
-          - compiler: ghc922
+          - compiler: ghc924
     steps:
     - uses: actions/checkout@v2.4.0
     - uses: cachix/install-nix-action@v15
