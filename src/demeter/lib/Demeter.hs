@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
@@ -175,6 +176,7 @@ module Demeter
   )
 where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent hiding (forkIO)
 import Control.Concurrent.STM
 import Control.Concurrent.STM.Fsifo
@@ -186,12 +188,12 @@ import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Conc (ThreadId (ThreadId))
 import GHC.Exts (fork#)
-import GHC.IO (IO (IO))
+import GHC.IO (IO (IO), unsafeUnmask)
 
 -- | A resource pool
 data Pool a = Pool
-  { -- The resource that have been used and returned to the pool. If they remain here for `resourceExpiry`, then they'll
-    -- be released by the reaper thread. The only way a resource can end up here is if there are no waiters in
+  { -- The resources that have been used and returned to the pool. If they remain here for `resourceExpiry`, then
+    -- they'll be released by the reaper thread. The only way a resource can end up here is if there are no waiters in
     -- `awaitingResources` at the time it's returned to the pool. The resources are approximately in descending return
     -- time order: the head of the list contains the resource that was returned most recently, with the greatest (or
     -- very close to the greatest) `entryTime`.
@@ -209,7 +211,7 @@ data Pool a = Pool
     resourceExpiry :: {-# UNPACK #-} !Nanoseconds,
     acquireResource :: IO a,
     releaseResource :: a -> IO (),
-    reaperThread :: {-# UNPACK #-} !(Thread ())
+    reaperThread :: {-# UNPACK #-} !(Thread (Maybe UnexpectedReaperException))
   }
 
 -- A "resource notification" is what one waiting on a resource will receive: either a resource, or permission to create
@@ -280,7 +282,9 @@ destroyPool Pool {reaperThread} = do
   let Thread tid doneVar = reaperThread
   uninterruptibleMask_ do
     killThread tid
-    atomically (readTMVar doneVar)
+    atomically (readTMVar doneVar) >>= \case
+      Nothing -> pure ()
+      Just exception -> throwIO exception
 
 data Thread a
   = Thread {-# UNPACK #-} !ThreadId {-# UNPACK #-} !(TMVar a)
@@ -290,7 +294,12 @@ nanoSecondsToSleepTime w =
   -- don't sleep less than 1 second
   max 1_000_000 (ns2td w + 1)
 
-data UnexpectedReaperException
+data WorkerDiedByAsyncException
+  = WorkerDiedByAsyncException SomeException -- invariant: this is an async exception
+  deriving stock (Show)
+  deriving anyclass (Exception)
+
+newtype UnexpectedReaperException
   = UnexpectedReaperException SomeException
   deriving stock (Show)
 
@@ -315,36 +324,60 @@ forkReaper ::
   TVar [PoolEntry a] ->
   TVar Int ->
   (a -> IO ()) ->
-  IO (Thread ())
+  IO (Thread (Maybe UnexpectedReaperException))
 forkReaper expiry waiters resourceVar createdResourceCountVar destroyAction = do
   mtid <- myThreadId
   resVar <- newEmptyTMVarIO
   workerCountVar <- newTVarIO @Int 0
+  -- If an async exception is raised in a worker, the worker (tries to) place the exception here
+  workerExceptionVar <- newEmptyTMVarIO
 
   tid <- mask_ $ forkIOWithUnmask \unmask -> do
-    let errHandler e = do
-          case fromException @AsyncException e of
-            Just ThreadKilled -> do
-              reap =<< readTVarIO resourceVar
-              waitForWorkers
-            _ -> do
-              throwTo mtid (UnexpectedReaperException e)
-          atomically (putTMVar resVar ())
+    let errHandler e = uninterruptibleMask_ do
+          reap =<< readTVarIO resourceVar
+          -- FIXME we don't want to wait for workers, then have a new worker spawned after
+          waitForWorkers
+          let propagateException e2 =
+                unsafeUnmask (try (throwTo mtid e2)) >>= \case
+                  Left e3
+                    | Just ThreadKilled <- fromException e3 -> atomically (putTMVar resVar (Just e2))
+                    | otherwise -> propagateException e2
+                  Right () -> atomically (putTMVar resVar Nothing)
+          case () of
+            ()
+              | Just ThreadKilled <- fromException e ->
+                  atomically do
+                    maybeWorkerException <- tryTakeTMVar workerExceptionVar
+                    putTMVar resVar $
+                      coerce @(Maybe SomeException) @(Maybe UnexpectedReaperException) maybeWorkerException
+              | Just (WorkerDiedByAsyncException e2) <- fromException e ->
+                  propagateException (UnexpectedReaperException e2)
+              | otherwise -> propagateException (UnexpectedReaperException e)
         expirySleepTime = nanoSecondsToSleepTime expiry
         action sleepTime = do
-          nap sleepTime
-          readTVarIO resourceVar >>= \case
-            -- If the resource var is empty, then we add ourselves as
-            -- a waiter to the resourceVar and return to sleep. Once a
-            -- value is put to the resource var we restart our loop
-            -- with 'expiry' sleep time (as a freshly returned
-            -- resource will remain valid for at least 'expiry' time).
-            --
-            -- This avoids waking up the reaper if there is no pool
-            -- activity or so much activity that resources are
-            -- returned straight to waiters.
-            [] -> atomically (guard . not . null =<< readTVar resourceVar) >> action expirySleepTime
-            _ -> reapDead >>= action
+          signal <- registerDelay (coerce @Microseconds @Int sleepTime)
+          (join . unmask . atomically) do
+            let workerDiedHandler = do
+                  exception <- readTMVar workerExceptionVar
+                  pure (errHandler (toException (WorkerDiedByAsyncException exception)))
+            let naptimeOverHandler = do
+                  readTVar signal >>= \case
+                    False -> retry
+                    True -> pure ()
+                  pure do
+                    readTVarIO resourceVar >>= \case
+                      -- If the resource var is empty, then we add ourselves as
+                      -- a waiter to the resourceVar and return to sleep. Once a
+                      -- value is put to the resource var we restart our loop
+                      -- with 'expiry' sleep time (as a freshly returned
+                      -- resource will remain valid for at least 'expiry' time).
+                      --
+                      -- This avoids waking up the reaper if there is no pool
+                      -- activity or so much activity that resources are
+                      -- returned straight to waiters.
+                      [] -> atomically (guard . not . null =<< readTVar resourceVar) >> action expirySleepTime
+                      _ -> reapDead >>= action
+            workerDiedHandler <|> naptimeOverHandler
         reapDead = do
           ct <- getCurrentTime
           let expiryAgo = ct - expiry
@@ -367,9 +400,13 @@ forkReaper expiry waiters resourceVar createdResourceCountVar destroyAction = do
           atomically (modifyTVar' workerCountVar (+ 1))
           _tid <- forkIO do
             destroyResource' destroyAction waiters resourceVar createdResourceCountVar resource
+              -- We know `e` is an async exception, because destroyResource' silences synchronous exceptions. We don't
+              -- want to ignore it, so we propagate it to the reaper, which will eventually propagate it to the thread
+              -- that created it.
+              `catch` \(e :: SomeException) -> void (atomically (tryPutTMVar workerExceptionVar e))
             atomically (modifyTVar' workerCountVar (subtract 1))
           pure ()
-    unmask (action expirySleepTime) `catch` (uninterruptibleMask_ . errHandler)
+    action expirySleepTime `catch` errHandler
   pure (Thread tid resVar)
 
 -- Return a resource notification to the pool.
@@ -412,9 +449,10 @@ popAvailable Pool {availableResources} = do
 -- We ignore release action exceptions because there are only two circumstances under which we destroy resources:
 --
 --   - A user callback threw an exception; we consider that exception more important.
+--   - The reaper is releasing a resource after it's been idle for `resourceExpiry`.
 --   - We are destroying the pool, so we don't care about release action exceptions.
 --
--- This action never throws an exception.
+-- This action never throws a synchronous exception.
 destroyResource :: Pool a -> a -> IO ()
 destroyResource Pool {releaseResource, awaitingResources, availableResources, createdResourceCount} c = do
   destroyResource' releaseResource awaitingResources availableResources createdResourceCount c
@@ -428,7 +466,7 @@ destroyResource' ::
   a ->
   IO ()
 destroyResource' release waiters rs crc r = do
-  release r `catch` \(_ :: SomeException) -> pure ()
+  release r `catchAllSynchronous` \_ -> pure ()
   atomically (returnResourceSTM' waiters rs crc CreationTicket)
 {-# INLINE destroyResource' #-}
 
@@ -528,9 +566,6 @@ ns2td (Nanoseconds w) = case microseconds >= largestIntWord of
     largestInt = maxBound @Int
     largestIntWord = fromIntegral @Int @Word64 largestInt
 
-nap :: Microseconds -> IO ()
-nap (Microseconds x) = threadDelay x
-
 getCurrentTime :: IO Nanoseconds
 getCurrentTime = coerce getMonotonicTimeNSec
 
@@ -540,3 +575,10 @@ forkIO (IO action) =
   IO \s0 ->
     case fork# action s0 of
       (# s1, tid #) -> (# s1, ThreadId tid #)
+
+catchAllSynchronous :: IO a -> (SomeException -> IO a) -> IO a
+catchAllSynchronous action handler =
+  action `catch` \e ->
+    case fromException e of
+      Just (SomeAsyncException _) -> throwIO e
+      _ -> handler e
