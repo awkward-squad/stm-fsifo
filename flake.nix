@@ -77,6 +77,22 @@
                             in !isHiddenFile;
                         in src';
                     in {
+                      hedgehog = let
+                        p = self.callHackageDirect {
+                          pkg = "hedgehog";
+                          ver = "1.2";
+                          sha256 =
+                            "1jak5p9qhnv8zq761wxbdygpj107llpi66m6d7hiaywymqq47giw";
+                        } { };
+                      in p;
+                      tasty-hedgehog = let
+                        p = self.callHackageDirect {
+                          pkg = "tasty-hedgehog";
+                          ver = "1.4.0.1";
+                          sha256 =
+                            "0bxpmi2nyn84zscnhi4bnhza4l7kjgddc9z7nr227iq2q0w56l1g";
+                        } { };
+                      in p;
                       demeter = let
                         p = self.callCabal2nix "demeter"
                           (cleanSource ./src/demeter) { };
