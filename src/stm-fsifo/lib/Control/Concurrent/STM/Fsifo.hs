@@ -4,8 +4,8 @@ module Control.Concurrent.STM.Fsifo
   ( Fsifo,
     newFsifo,
     newFsifoIO,
-    push,
-    pop,
+    pushFsifo,
+    popFsifo,
   )
 where
 
@@ -37,7 +37,7 @@ data TDList a
       {-# UNPACK #-} !(TVar (TDList a))
   | TNil
 
--- | Create a @Fsifo@
+-- | Create a @Fsifo@.
 newFsifo :: STM (Fsifo a)
 newFsifo = do
   emptyVarL <- newTVar TNil
@@ -45,7 +45,7 @@ newFsifo = do
   pure (Fsifo emptyVarL emptyVarR)
 {-# INLINEABLE newFsifo #-}
 
--- | Create a @Fsifo@ in @IO@
+-- | Create a @Fsifo@ in @IO@.
 newFsifoIO :: IO (Fsifo a)
 newFsifoIO = do
   emptyVarL <- newTVarIO TNil
@@ -91,7 +91,7 @@ removeSelf tv prevPP prevP nextP = do
 
 -- | Push an element onto a queue.
 --
--- @push@ returns an action that attempts to remove the element from
+-- @pushFsifo@ returns an action that attempts to remove the element from
 -- the queue.
 --
 -- The action returns:
@@ -99,8 +99,8 @@ removeSelf tv prevPP prevP nextP = do
 -- * @True@ if the element was removed from the queue
 --
 -- * @False@ if the element was discovered to be no longer in the queue
-push :: Fsifo a -> a -> STM (STM Bool)
-push (Fsifo _ tv) a = do
+pushFsifo :: Fsifo a -> a -> STM (STM Bool)
+pushFsifo (Fsifo _ tv) a = do
   fwdPointer <- readTVar tv
   backPointer <- newTVar fwdPointer
   emptyVar <- newTVar TNil
@@ -108,14 +108,14 @@ push (Fsifo _ tv) a = do
   writeTVar fwdPointer cell
   writeTVar tv emptyVar
   pure (maybeRemoveSelf tv backPointer emptyVar)
-{-# INLINEABLE push #-}
+{-# INLINEABLE pushFsifo #-}
 
 -- | Pop an element from a queue.
-pop :: Fsifo a -> STM (Maybe a)
-pop (Fsifo hv tv) = do
+popFsifo :: Fsifo a -> STM (Maybe a)
+popFsifo (Fsifo hv tv) = do
   readTVar hv >>= \case
     TNil -> pure Nothing
     TCons bp a fp -> do
       removeSelf tv bp hv fp
       pure (Just a)
-{-# INLINEABLE pop #-}
+{-# INLINEABLE popFsifo #-}

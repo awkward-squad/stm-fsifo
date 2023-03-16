@@ -74,7 +74,7 @@ prop_queue = property do
               <$> liftIO
                 ( atomically do
                     q <- readTVar qvar
-                    Fsifo.push q n
+                    Fsifo.pushFsifo q n
                 )
           upd = Update \(QueueModel s pushCount im _) (Push i) out ->
             let !pushCount' = pushCount + 1
@@ -92,7 +92,7 @@ prop_queue = property do
           execute Pop = do
             liftIO $ atomically do
               q <- readTVar qvar
-              Fsifo.pop q
+              Fsifo.popFsifo q
           upd = Update \(QueueModel s pushCount im _) Pop _out ->
             let mk = fst <$> IM.lookupGE minBound s
                 s' = maybe s (\k -> IM.delete k s) mk
