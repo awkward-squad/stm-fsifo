@@ -325,14 +325,15 @@ forkReaper expiry waiters resourceVar createdResourceCountVar destroyAction = do
             _ -> reapDead >>= action
         reapDead = do
           ct <- getCurrentTime
+          let expiryAgo = ct - expiry
           (living, dead) <- atomically do
-            (living, dead) <- span (\x -> ct - expiry >= entryTime x) <$> readTVar resourceVar
+            (living, dead) <- span (\x -> expiryAgo < entryTime x) <$> readTVar resourceVar
             writeTVar resourceVar living
             pure (living, dead)
           reap dead
           pure $ case living of
             [] -> expirySleepTime
-            _ -> nanoSecondsToSleepTime (entryTime $ last living)
+            _ -> nanoSecondsToSleepTime ((entryTime $ last living) - expiryAgo)
         reap xs = do
           traverse_ (releaseWithWorker . entryValue) xs
         waitForWorkers = do
