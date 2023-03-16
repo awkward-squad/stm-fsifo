@@ -1,5 +1,8 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -14,6 +17,7 @@ import Data.IntMap (IntMap)
 import qualified Data.IntMap.Strict as IM
 import Data.Kind
 import Data.Maybe
+import GHC.Generics (Generic)
 import Hedgehog
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
@@ -154,28 +158,20 @@ data QueueModel (v :: Type -> Type) = QueueModel
   }
 
 data Push (v :: Type -> Type) = Push Int
-  deriving (Show, Eq)
-
-instance HTraversable Push where
-  htraverse _ (Push x) = pure (Push x)
+  deriving stock (Show, Eq, Generic)
+  deriving anyclass (FunctorB, TraversableB)
 
 data Check (v :: Type -> Type) = Check
-  deriving (Show, Eq)
-
-instance HTraversable Check where
-  htraverse _ Check = pure Check
+  deriving stock (Show, Eq, Generic)
+  deriving anyclass (FunctorB, TraversableB)
 
 data Pop (v :: Type -> Type) = Pop
-  deriving (Show, Eq)
-
-instance HTraversable Pop where
-  htraverse _ Pop = pure Pop
+  deriving stock (Show, Eq, Generic)
+  deriving anyclass (FunctorB, TraversableB)
 
 data RemoveSelf (v :: Type -> Type) = RemoveSelf Int (Var DeleteFromQueue v)
-  deriving (Show)
-
-instance HTraversable RemoveSelf where
-  htraverse eta (RemoveSelf x v) = RemoveSelf x <$> htraverse eta v
+  deriving stock (Show, Generic)
+  deriving anyclass (FunctorB, TraversableB)
 
 peekAll :: Fsifo.Fsifo a -> STM [a]
 peekAll = toList . unsafeCoerce
