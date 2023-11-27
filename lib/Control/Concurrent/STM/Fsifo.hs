@@ -11,23 +11,26 @@ import Control.Concurrent.STM (STM, TVar, newTVar, newTVarIO, readTVar, writeTVa
 
 -- | A first-/still/-in-first-out queue that supports
 --
---   * \( O(1) \) push
---   * \( O(1) \) pop
---   * \( O(1) \) delete
+--   * \(\mathcal{O}(1)\) push
+--   * \(\mathcal{O}(1)\) pop
+--   * \(\mathcal{O}(1)\) delete
 data Fsifo a
   = Fsifo
-      {-# UNPACK #-} !(LinkedListP a) -- Pop end (see below)
-      {-# UNPACK #-} !(LinkedListPP a) -- Push end (see below)
+       -- Pop end (see below)
+       -- Invariant: if queue is non-empty, points at a node whose back-pointer points right back here
+      {-# UNPACK #-} !(LinkedListP a)
+      -- Push end (see below)
+      -- Invariant: points at the one pointer that's pointing at End
+      {-# UNPACK #-} !(LinkedListPP a)
 
 -- A Fsifo containing elements [1, 2, 3] is depicted by the following diagram:
---
 --
 --              +-----+-----+-----+          +-----+-----+-----+          +-----+-----+-----+
 --     +-> Node |     |  1  |   ------> Node |     |  2  |   ------> Node |     |  3  |   ------> End
 --     |        +-|---+-----+-----+          +--|--+-----+-----+          +--|--+-----+-----+
 --     |          |            ^                |           ^                |           ^
+--     |          |            |                |           |                |           |
 --     |          |            +----------------+           +----------------+           |
---     |          |                                                                      |
 --     |          |                                                                      |
 --     |          v                                                                      |
 --     |     +-----+                                                                  +--|--+
@@ -43,17 +46,27 @@ data Fsifo a
 -- a backwards pointer back to the entire previous node.
 --
 -- Also, this way, the first node's backwards pointer can conveniently point to the queue's read end, which is not a
--- node, just a pointer to a node ;)
+-- node, just a pointer to a node.
 --
--- FIXME: wait, why is that convenient?
+-- When an element is either popped or deleted, in addition to adjusting the surrounding nodes' backwards- and forwards-
+-- pointers in the straightforward way, as well as the queue's pop and push end as necessary, the node itself is
+-- contorted to look like this:
 --
--- FIXME: say more about how the structure is transformed during a delete
+--          +-----+-----+-----+
+--     Node |     |     |   ------>
+--          +-|---+-----+-----+
+--            |            ^
+--            |            |
+--            +------------+
+--
+-- That way, we can answer the question "has this node already been popped/deleted?" with "iff its back-pointer points
+-- to its forward-pointer". This lets us avoid doing anything if the delete action is called twice, or called after pop.
 
 data LinkedList a
   = Node
-      {-# UNPACK #-} !(LinkedListPP a)
-      a
-      {-# UNPACK #-} !(LinkedListP a)
+      {-# UNPACK #-} !(LinkedListPP a) -- back-pointer
+      a -- value
+      {-# UNPACK #-} !(LinkedListP a) -- forward-pointer
   | End
 
 -- Do these aliases help or hurt? :/
@@ -72,7 +85,7 @@ newFsifo = do
   pure (Fsifo pop push)
 {-# INLINEABLE newFsifo #-}
 
--- | Create a @Fsifo@ in @IO@.
+-- | Create a queue in @IO@.
 newFsifoIO :: IO (Fsifo a)
 newFsifoIO = do
   pop <- newTVarIO End
@@ -82,27 +95,26 @@ newFsifoIO = do
 
 -- | Push an element onto a queue.
 --
--- @pushFsifo@ returns an action that attempts to remove the element from
+-- @pushFsifo@ returns an action that attempts to delete the element from
 -- the queue.
 --
 -- The action returns:
 --
--- * @True@ if the element was removed from the queue
+-- * @True@ if the element was successfully deleted from the queue
 --
--- * @False@ if the element was discovered to be no longer in the queue
+-- * @False@ if the element had already been popped or deleted from the queue
 pushFsifo :: Fsifo a -> a -> STM (STM Bool)
 pushFsifo (Fsifo _pop push) lbjVal = do
   -- In these variable names,
   --   "jfk" refers to the old latest element (before this push)
   --   "lbj" refers to the new latest element (this push)
-  -- referring to the US presidents
-  --   FDR -> Truman -> Eisenhower -> JFK -> LBJ
+  -- referring to the US president JFK who was succeeded by LBJ
   jfkForward <- readTVar push
   lbjBack <- newTVar jfkForward
   lbjForward <- newTVar End
   writeTVar jfkForward (Node lbjBack lbjVal lbjForward)
   writeTVar push lbjForward
-  pure (maybeRemoveSelf push lbjBack lbjForward)
+  pure (maybeDeleteSelf push lbjBack lbjForward)
 {-# INLINEABLE pushFsifo #-}
 
 -- | Pop an element from a queue.
@@ -110,12 +122,12 @@ popFsifo :: Fsifo a -> STM (Maybe a)
 popFsifo (Fsifo pop push) = do
   readTVar pop >>= \case
     End -> pure Nothing
-    Node backPP x forwardP -> do
-      removeSelf push backPP pop forwardP
-      pure (Just x)
+    Node back val forward -> do
+      deleteSelf push back pop forward
+      pure (Just val)
 {-# INLINEABLE popFsifo #-}
 
-maybeRemoveSelf ::
+maybeDeleteSelf ::
   -- The queue's push end
   LinkedListPP a ->
   -- Our back pointer
@@ -123,36 +135,36 @@ maybeRemoveSelf ::
   -- Our forward pointter
   LinkedListP a ->
   STM Bool
-maybeRemoveSelf push backPP forwardP = do
-  backP <- readTVar backPP
+maybeDeleteSelf push back forward = do
+  prevForward <- readTVar back
   -- If our back pointer points to our forward pointer then we have
-  -- already been removed from the queue
-  case backP == forwardP of
+  -- already been deleted from the queue
+  case prevForward == forward of
     True -> pure False
     False -> do
-      removeSelf push backPP backP forwardP
+      deleteSelf push back prevForward forward
       pure True
-{-# INLINE maybeRemoveSelf #-}
+{-# INLINE maybeDeleteSelf #-}
 
--- Like maybeRemoveSelf, but doesn't check whether or not we have
--- already been removed.
-removeSelf ::
+-- Like maybeDeleteSelf, but doesn't check whether or not we have
+-- already been deleted.
+deleteSelf ::
   -- The queue's push end
   LinkedListPP a ->
   -- Our back pointer
   LinkedListPP a ->
-  -- Our back pointer's contents
+  -- Our back pointer's contents, the previous node's forward pointer
   LinkedListP a ->
-  -- Our forward pointter
+  -- Our forward pointer
   LinkedListP a ->
   STM ()
-removeSelf push backPP backP forwardP = do
-  forward <- readTVar forwardP
-  writeTVar backP forward
-  case forward of
-    End -> writeTVar push backP
-    Node forwardBackPP _ _ -> writeTVar forwardBackPP backP
+deleteSelf push back prevForward forward = do
+  next <- readTVar forward
+  writeTVar prevForward next
+  case next of
+    End -> writeTVar push prevForward
+    Node nextBack _ _ -> writeTVar nextBack prevForward
   -- point the back pointer to the forward pointer as a sign that
-  -- the cell has been popped (referenced in maybeRemoveSelf)
-  writeTVar backPP forwardP
-{-# INLINE removeSelf #-}
+  -- the cell has been deleted (referenced in maybeDeleteSelf)
+  writeTVar back forward
+{-# INLINE deleteSelf #-}
