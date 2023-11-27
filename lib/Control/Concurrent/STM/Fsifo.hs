@@ -1,5 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
-
 module Control.Concurrent.STM.Fsifo
   ( Fsifo,
     newFsifo,
@@ -9,8 +7,7 @@ module Control.Concurrent.STM.Fsifo
   )
 where
 
-import Control.Concurrent.STM
-import Data.Functor
+import Control.Concurrent.STM (STM, TVar, newTVar, newTVarIO, readTVar, writeTVar)
 
 -- | A first-/still/-in-first-out queue that supports
 --
@@ -19,75 +16,69 @@ import Data.Functor
 --   * \( O(1) \) delete
 data Fsifo a
   = Fsifo
-      {-# UNPACK #-} !(TVar (TDList a))
-      -- ^ The head of the list
-      {-# UNPACK #-} !(TVar (TVar (TDList a)))
-      -- ^ Pointer to the final forward pointer in the list
+      {-# UNPACK #-} !(LinkedListP a) -- Pop end (see below)
+      {-# UNPACK #-} !(LinkedListPP a) -- Push end (see below)
 
--- This is similar to a double-ended doubly-linked queue, but employs
--- a few simplifications afforded by the limited interface.
+-- A Fsifo containing elements [1, 2, 3] is depicted by the following diagram:
+--
+--
+--              +-----+-----+-----+          +-----+-----+-----+          +-----+-----+-----+
+--     +-> Node |     |  1  |   ------> Node |     |  2  |   ------> Node |     |  3  |   ------> End
+--     |        +-|---+-----+-----+          +--|--+-----+-----+          +--|--+-----+-----+
+--     |          |            ^                |           ^                |           ^
+--     |          |            +----------------+           +----------------+           |
+--     |          |                                                                      |
+--     |          |                                                                      |
+--     |          v                                                                      |
+--     |     +-----+                                                                  +--|--+
+--     +--------   |                                                                  |     |
+--           +-----+                                                                  +-----+
+--            Pop end                                                                  Push end
+--
+-- As you can see, it's a relatively standard doubly-linked structure with backwards- and forwards-pointers, except
+-- each backwards pointer doesn't actually point at the entire previous node, but rather the previous node's forward
+-- pointer.
+--
+-- This is simply done for efficiency; none of the supported operations (push, pop, delete) require being able to follow
+-- a backwards pointer back to the entire previous node.
+--
+-- Also, this way, the first node's backwards pointer can conveniently point to the queue's read end, which is not a
+-- node, just a pointer to a node ;)
+--
+-- FIXME: wait, why is that convenient?
+--
+-- FIXME: say more about how the structure is transformed during a delete
 
--- | Each element has a pointer to the previous element's forward
--- pointer where "previous element" can be a 'TDList' or the 'Fsifo'
--- head pointer.
-data TDList a
-  = TCons
-      {-# UNPACK #-} !(TVar (TVar (TDList a)))
+data LinkedList a
+  = Node
+      {-# UNPACK #-} !(LinkedListPP a)
       a
-      {-# UNPACK #-} !(TVar (TDList a))
-  | TNil
+      {-# UNPACK #-} !(LinkedListP a)
+  | End
 
--- | Create a @Fsifo@.
+-- Do these aliases help or hurt? :/
+
+type LinkedListP a =
+  TVar (LinkedList a)
+
+type LinkedListPP a =
+  TVar (LinkedListP a)
+
+-- | Create a queue.
 newFsifo :: STM (Fsifo a)
 newFsifo = do
-  emptyVarL <- newTVar TNil
-  emptyVarR <- newTVar emptyVarL
-  pure (Fsifo emptyVarL emptyVarR)
+  pop <- newTVar End
+  push <- newTVar pop
+  pure (Fsifo pop push)
 {-# INLINEABLE newFsifo #-}
 
 -- | Create a @Fsifo@ in @IO@.
 newFsifoIO :: IO (Fsifo a)
 newFsifoIO = do
-  emptyVarL <- newTVarIO TNil
-  emptyVarR <- newTVarIO emptyVarL
-  pure (Fsifo emptyVarL emptyVarR)
+  pop <- newTVarIO End
+  push <- newTVarIO pop
+  pure (Fsifo pop push)
 {-# INLINEABLE newFsifoIO #-}
-
-maybeRemoveSelf ::
-  -- | 'Fsifo's final foward pointer pointer
-  TVar (TVar (TDList a)) ->
-  -- | Our back pointer
-  TVar (TVar (TDList a)) ->
-  -- | Our forward pointter
-  TVar (TDList a) ->
-  STM Bool
-maybeRemoveSelf tv prevPP nextP = do
-  prevP <- readTVar prevPP
-  -- If our back pointer points to our forward pointer then we have
-  -- already been removed from the queue
-  case prevP == nextP of
-    True -> pure False
-    False -> removeSelf tv prevPP prevP nextP $> True
-{-# INLINE maybeRemoveSelf #-}
-
--- Like maybeRemoveSelf, but doesn't check whether or not we have
--- already been removed.
-removeSelf ::
-  TVar (TVar (TDList a)) ->
-  TVar (TVar (TDList a)) ->
-  TVar (TDList a) ->
-  TVar (TDList a) ->
-  STM ()
-removeSelf tv prevPP prevP nextP = do
-  next <- readTVar nextP
-  writeTVar prevP next
-  case next of
-    TNil -> writeTVar tv prevP
-    TCons bp _ _ -> writeTVar bp prevP
-  -- point the back pointer to the forward pointer as a sign that
-  -- the cell has been popped (referenced in maybeRemoveSelf)
-  writeTVar prevPP nextP
-{-# INLINE removeSelf #-}
 
 -- | Push an element onto a queue.
 --
@@ -100,22 +91,68 @@ removeSelf tv prevPP prevP nextP = do
 --
 -- * @False@ if the element was discovered to be no longer in the queue
 pushFsifo :: Fsifo a -> a -> STM (STM Bool)
-pushFsifo (Fsifo _ tv) a = do
-  fwdPointer <- readTVar tv
-  backPointer <- newTVar fwdPointer
-  emptyVar <- newTVar TNil
-  let cell = TCons backPointer a emptyVar
-  writeTVar fwdPointer cell
-  writeTVar tv emptyVar
-  pure (maybeRemoveSelf tv backPointer emptyVar)
+pushFsifo (Fsifo _pop push) fordVal = do
+  -- In these variable names,
+  --   "nixon" refers to the old latest element (before this push)
+  --   "ford" refers to the new latest element (this push)
+  -- referring to the US presidents
+  --   FDR -> Truman -> Eisenhower -> JFK -> LBJ -> Nixon -> Ford
+  nixonForward <- readTVar push
+  fordBack <- newTVar nixonForward
+  fordForward <- newTVar End
+  writeTVar nixonForward (Node fordBack fordVal fordForward)
+  writeTVar push fordForward
+  pure (maybeRemoveSelf push fordBack fordForward)
 {-# INLINEABLE pushFsifo #-}
 
 -- | Pop an element from a queue.
 popFsifo :: Fsifo a -> STM (Maybe a)
-popFsifo (Fsifo hv tv) = do
-  readTVar hv >>= \case
-    TNil -> pure Nothing
-    TCons bp a fp -> do
-      removeSelf tv bp hv fp
-      pure (Just a)
+popFsifo (Fsifo pop push) = do
+  readTVar pop >>= \case
+    End -> pure Nothing
+    Node backPP x forwardP -> do
+      removeSelf push backPP pop forwardP
+      pure (Just x)
 {-# INLINEABLE popFsifo #-}
+
+maybeRemoveSelf ::
+  -- The queue's push end
+  LinkedListPP a ->
+  -- Our back pointer
+  LinkedListPP a ->
+  -- Our forward pointter
+  LinkedListP a ->
+  STM Bool
+maybeRemoveSelf push backPP forwardP = do
+  backP <- readTVar backPP
+  -- If our back pointer points to our forward pointer then we have
+  -- already been removed from the queue
+  case backP == forwardP of
+    True -> pure False
+    False -> do
+      removeSelf push backPP backP forwardP
+      pure True
+{-# INLINE maybeRemoveSelf #-}
+
+-- Like maybeRemoveSelf, but doesn't check whether or not we have
+-- already been removed.
+removeSelf ::
+  -- The queue's push end
+  LinkedListPP a ->
+  -- Our back pointer
+  LinkedListPP a ->
+  -- Our back pointer's contents
+  LinkedListP a ->
+  -- Our forward pointter
+  LinkedListP a ->
+  STM ()
+removeSelf push backPP backP forwardP = do
+  forward <- readTVar forwardP
+  writeTVar backP forward
+  case forward of
+    End -> writeTVar push backP
+    Node forwardBackPP _ _ -> writeTVar forwardBackPP backP
+  -- point the back pointer to the forward pointer as a sign that
+  -- the cell has been popped (referenced in maybeRemoveSelf)
+  writeTVar backPP forwardP
+{-# INLINE removeSelf #-}

@@ -8,7 +8,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TypeApplications #-}
 
-module Main where
+module Main (main) where
 
 import Control.Concurrent.STM
 import qualified Control.Concurrent.STM.Fsifo as Fsifo
@@ -186,10 +186,10 @@ toList (Q hv _) =
 
 data Q a
   = Q
+      -- | The head of the list
       {-# UNPACK #-} !(TVar (TDList a))
-      -- ^ The head of the list
+      -- | Pointer to the final forward pointer in the list
       {-# UNPACK #-} !(TVar (TVar (TDList a)))
-      -- ^ Pointer to the final forward pointer in the list
 
 -- | Each element has a pointer to the previous element's forward
 -- pointer where "previous element" can be a 'TDList' or the 'Fsifo'
