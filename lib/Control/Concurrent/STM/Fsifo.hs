@@ -91,18 +91,18 @@ newFsifoIO = do
 --
 -- * @False@ if the element was discovered to be no longer in the queue
 pushFsifo :: Fsifo a -> a -> STM (STM Bool)
-pushFsifo (Fsifo _pop push) fordVal = do
+pushFsifo (Fsifo _pop push) lbjVal = do
   -- In these variable names,
-  --   "nixon" refers to the old latest element (before this push)
-  --   "ford" refers to the new latest element (this push)
+  --   "jfk" refers to the old latest element (before this push)
+  --   "lbj" refers to the new latest element (this push)
   -- referring to the US presidents
-  --   FDR -> Truman -> Eisenhower -> JFK -> LBJ -> Nixon -> Ford
-  nixonForward <- readTVar push
-  fordBack <- newTVar nixonForward
-  fordForward <- newTVar End
-  writeTVar nixonForward (Node fordBack fordVal fordForward)
-  writeTVar push fordForward
-  pure (maybeRemoveSelf push fordBack fordForward)
+  --   FDR -> Truman -> Eisenhower -> JFK -> LBJ
+  jfkForward <- readTVar push
+  lbjBack <- newTVar jfkForward
+  lbjForward <- newTVar End
+  writeTVar jfkForward (Node lbjBack lbjVal lbjForward)
+  writeTVar push lbjForward
+  pure (maybeRemoveSelf push lbjBack lbjForward)
 {-# INLINEABLE pushFsifo #-}
 
 -- | Pop an element from a queue.
