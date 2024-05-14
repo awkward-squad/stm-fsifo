@@ -10,7 +10,7 @@ license: BSD-3-Clause
 maintainer: Travis Staton <hello@travisstaton.com>, Mitchell Dalvi Rosen <mitchellwrosen@gmail.com>
 name: stm-fsifo
 synopsis: A FIFO queue that supports deleting an enqueued element
-tested-with: GHC == 9.6.5, GHC == 9.8.2, GHC == 9.10.1
+tested-with: GHC == 9.4.8, GHC == 9.6.5, GHC == 9.8.2
 version: 1.0.0
 
 description:
