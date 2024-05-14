@@ -56,8 +56,8 @@ test-suite test
   import: component
   build-depends:
     base,
-    containers ^>= 0.6,
-    hedgehog ^>= 1.2,
+    containers ^>= 0.6 || ^>= 0.7,
+    hedgehog ^>= 1.4,
     stm,
     stm-fsifo,
     tasty ^>= 1.4,
