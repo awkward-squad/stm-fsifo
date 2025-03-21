@@ -10,7 +10,7 @@ license: BSD-3-Clause
 maintainer: Travis Staton <hello@travisstaton.com>, Mitchell Dalvi Rosen <mitchellwrosen@gmail.com>
 name: stm-fsifo
 synopsis: A FIFO queue that supports deleting an enqueued element
-tested-with: GHC == 9.4.8, GHC == 9.6.5, GHC == 9.8.2
+tested-with: GHC == 9.8.4, GHC == 9.10.1, GHC == 9.12.2
 version: 1.0.0
 
 description:
@@ -45,7 +45,7 @@ common component
 library
   import: component
   build-depends:
-    base ^>= 4.14 || ^>= 4.15 || ^>= 4.16 || ^>= 4.17 || ^>= 4.18 || ^>= 4.19,
+    base ^>= 4.14 || ^>= 4.15 || ^>= 4.16 || ^>= 4.17 || ^>= 4.18 || ^>= 4.19 || ^>= 4.20 || ^>= 4.21,
     stm ^>= 2.5.0,
   default-extensions:
     LambdaCase
