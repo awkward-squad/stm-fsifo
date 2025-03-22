@@ -1,26 +1,20 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DeriveAnyClass #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 
 module Main (main) where
 
 import Control.Concurrent.STM
-import qualified Control.Concurrent.STM.TokenQueue as TokenQueue
+import Control.Concurrent.STM.TokenQueue qualified as TokenQueue
 import Control.Monad.IO.Class
 import Data.IntMap (IntMap)
-import qualified Data.IntMap.Strict as IM
+import Data.IntMap.Strict qualified as IM
 import Data.Kind
 import Data.Maybe
 import GHC.Generics (Generic)
 import Hedgehog
-import qualified Hedgehog.Gen as Gen
-import qualified Hedgehog.Range as Range
+import Hedgehog.Gen qualified as Gen
+import Hedgehog.Range qualified as Range
 import Test.Tasty
 import Test.Tasty.Hedgehog
 import Unsafe.Coerce (unsafeCoerce)
@@ -38,7 +32,7 @@ main =
 
 prop_queue :: Property
 prop_queue = property do
-  qvar <- liftIO $ newTVarIO =<< TokenQueue.newTokenQueueIO
+  qvar <- liftIO $ newTVarIO =<< TokenQueue.newIO
   actions <-
     forAll $
       Gen.sequential
@@ -61,12 +55,12 @@ prop_queue = property do
         }
 
     resetQ qvar = atomically do
-      q <- TokenQueue.newTokenQueue
+      q <- TokenQueue.new
       writeTVar qvar q
 
     s_push qvar =
-      let gen QueueModel {..} =
-            case isChecked of
+      let gen model =
+            case model.isChecked of
               True -> Just (Push <$> Gen.integral Range.constantBounded)
               False -> Nothing
           execute (Push n) = do
@@ -74,66 +68,65 @@ prop_queue = property do
               <$> liftIO
                 ( atomically do
                     q <- readTVar qvar
-                    TokenQueue.pushTokenQueue q n
+                    TokenQueue.push q n
                 )
           upd = Update \(QueueModel s pushCount im _) (Push i) out ->
             let !pushCount' = pushCount + 1
                 im' = IM.insert pushCount' out im
                 s' = IM.insert pushCount' i s
              in QueueModel s' pushCount' im' False
-          preCond = Require \QueueModel {..} _ -> isChecked
+          preCond = Require \model _ -> model.isChecked
        in Command gen execute [upd, preCond]
 
     s_pop qvar =
-      let gen QueueModel {..} =
-            case isChecked of
+      let gen model =
+            case model.isChecked of
               True -> Just (pure Pop)
               False -> Nothing
           execute Pop = do
             liftIO $ atomically do
               q <- readTVar qvar
-              TokenQueue.popTokenQueue q
+              TokenQueue.pop q
           upd = Update \(QueueModel s pushCount im _) Pop _out ->
             let mk = fst <$> IM.lookupGE minBound s
                 s' = maybe s (\k -> IM.delete k s) mk
              in QueueModel s' pushCount im False
-          precond = Require \QueueModel {..} _ -> isChecked
-          postcond = Ensure \QueueModel {..} _ _ actualPop ->
-            let smallestElem = snd <$> IM.lookupGE minBound queueRep
+          precond = Require \model _ -> model.isChecked
+          postcond = Ensure \model _ _ actualPop ->
+            let smallestElem = snd <$> IM.lookupGE minBound model.queueRep
              in smallestElem === actualPop
        in Command gen execute [upd, precond, postcond]
 
     s_removeSelf _ =
-      let gen QueueModel {..} =
-            case isChecked && pushCount >= 0 of
+      let gen model =
+            case model.isChecked && model.pushCount >= 0 of
               True -> Just do
-                i <- Gen.integral (Range.constant 0 pushCount)
-                pure (RemoveSelf i (fromJust (IM.lookup i removeSelfMap)))
+                i <- Gen.integral (Range.constant 0 model.pushCount)
+                pure (RemoveSelf i (fromJust (IM.lookup i model.removeSelfMap)))
               False -> Nothing
-          execute (RemoveSelf _ (Var (Concrete (DeleteFromQueue stm)))) = do
-            liftIO (print =<< atomically stm)
+          execute (RemoveSelf _ (Var (Concrete (DeleteFromQueue token)))) = do
+            liftIO (print =<< atomically (TokenQueue.delete token))
           upd = Update \(QueueModel s pushCount im _) (RemoveSelf i _) _ ->
             QueueModel (IM.delete i s) pushCount im False
-          preCond = Require \QueueModel {..} _ -> isChecked
+          preCond = Require \model _ -> model.isChecked
        in Command gen execute [upd, preCond]
 
     s_check qvar =
-      let gen QueueModel {..} =
-            case isChecked of
+      let gen model =
+            case model.isChecked of
               True -> Nothing
               False -> Just (pure Check)
           execute Check = do
             liftIO (atomically $ peekAll =<< readTVar qvar)
           upd = Update \(QueueModel im s pushCount _) Check _ ->
             QueueModel im s pushCount True
-          postcond = Ensure \_ QueueModel {..} Check xs ->
-            xs === map snd (IM.toAscList queueRep)
-          precond = Require \QueueModel {..} _ -> not isChecked
+          postcond = Ensure \_ model Check xs ->
+            xs === map snd (IM.toAscList model.queueRep)
+          precond = Require \model _ -> not model.isChecked
        in Command gen execute [upd, precond, postcond]
 
--- A newtype for our STM delete action since a Show instance is
--- required for outputs
-newtype DeleteFromQueue = DeleteFromQueue (STM Bool)
+-- A newtype for our token since a Show instance is required for outputs
+newtype DeleteFromQueue = DeleteFromQueue TokenQueue.Token
 
 instance Show DeleteFromQueue where
   show _ = "<stm>"

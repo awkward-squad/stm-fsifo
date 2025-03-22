@@ -1,15 +1,21 @@
 module Control.Concurrent.STM.TokenQueue
   ( TokenQueue,
-    newTokenQueue,
-    newTokenQueueIO,
-    pushTokenQueue,
-    popTokenQueue,
+    Token,
+    new,
+    newIO,
+    push,
+    push_,
+    pop,
+    delete,
+    delete_,
   )
 where
 
 import Control.Concurrent.STM (STM, TVar, newTVar, newTVarIO, readTVar, writeTVar)
+import Data.Coerce (coerce)
+import Data.Functor (void)
 
--- | A first-/still/-in-first-out queue that supports
+-- | A "token queue" data structure that supports
 --
 --   * \(\mathcal{O}(1)\) push
 --   * \(\mathcal{O}(1)\) pop
@@ -18,25 +24,25 @@ data TokenQueue a
   = TokenQueue
       -- Pop end (see below)
       -- Invariant: if queue is non-empty, points at a node whose back-pointer points right back here
-      {-# UNPACK #-} !(LinkedListP a)
+      {-# UNPACK #-} !(ListP a)
       -- Push end (see below)
-      -- Invariant: points at the one pointer that's pointing at End
-      {-# UNPACK #-} !(LinkedListPP a)
+      -- Invariant: points at the one pointer that's pointing at PushEnd
+      {-# UNPACK #-} !(ListPP a)
 
 -- A token queue containing elements [1, 2, 3] is depicted by the following diagram:
 --
---              +-----+-----+-----+          +-----+-----+-----+          +-----+-----+-----+
---     +-> Node |     |  1  |   ------> Node |     |  2  |   ------> Node |     |  3  |   ------> End
---     |        +-|---+-----+-----+          +--|--+-----+-----+          +--|--+-----+-----+
---     |          |            ^                |           ^                |           ^
---     |          |            |                |           |                |           |
---     |          |            +----------------+           +----------------+           |
---     |          |                                                                      |
---     |          v                                                                      |
---     |     +-----+                                                                  +--|--+
---     +--------   |                                                                  |     |
---           +-----+                                                                  +-----+
---            Pop end                                                                  Push end
+--          Node--+-----+-----+     Node--+-----+-----+     Node--+-----+-----+
+--     +--> |     |  1  |   ------> |     |  2  |   ------> |     |  3  |   ------> End
+--     |    +-|---+-----+-----+     +--|--+-----+-----+     +--|--+-----+-----+
+--     |      |            ^           |           ^           |           ^
+--     |      |            |           |           |           |           |
+--     |      |            +-----------+           +-----------+           |
+--     |      |                                                            |
+--     |      v                                                            |
+--     |   +-----+                                                      +--|--+
+--     +------   |                                                      |     |
+--         +-----+                                                      +-----+
+--         Pop end                                                      Push end
 --
 -- As you can see, it's a relatively standard doubly-linked structure with backwards- and forwards-pointers, except
 -- each backwards pointer doesn't actually point at the entire previous node, but rather the previous node's forward
@@ -62,87 +68,98 @@ data TokenQueue a
 -- That way, we can answer the question "has this node already been popped/deleted?" with "iff its back-pointer points
 -- to its forward-pointer". This lets us avoid doing anything if the delete action is called twice, or called after pop.
 
-data LinkedList a
+data List a
   = Node
-      {-# UNPACK #-} !(LinkedListPP a) -- back-pointer
+      {-# UNPACK #-} !(ListPP a) -- back-pointer
       a -- value
-      {-# UNPACK #-} !(LinkedListP a) -- forward-pointer
-  | End
+      {-# UNPACK #-} !(ListP a) -- forward-pointer
+  | PushEnd
+
+-- | A token associated with an element that was pushed onto a token queue, which can be used to attempt to delete the
+-- element.
+newtype Token
+  = Token (STM Bool)
 
 -- Do these aliases help or hurt? :/
 
-type LinkedListP a =
-  TVar (LinkedList a)
+type ListP a =
+  TVar (List a)
 
-type LinkedListPP a =
-  TVar (LinkedListP a)
+type ListPP a =
+  TVar (ListP a)
 
--- | Create a queue.
-newTokenQueue :: STM (TokenQueue a)
-newTokenQueue = do
-  pop <- newTVar End
-  push <- newTVar pop
-  pure (TokenQueue pop push)
-{-# INLINEABLE newTokenQueue #-}
+-- | Create an empty token queue.
+new :: STM (TokenQueue a)
+new = do
+  popEnd <- newTVar PushEnd
+  pushEnd <- newTVar popEnd
+  pure (TokenQueue popEnd pushEnd)
+{-# INLINEABLE new #-}
 
--- | Create a queue in @IO@.
-newTokenQueueIO :: IO (TokenQueue a)
-newTokenQueueIO = do
-  pop <- newTVarIO End
-  push <- newTVarIO pop
-  pure (TokenQueue pop push)
-{-# INLINEABLE newTokenQueueIO #-}
+-- | Create an empty token queue in @IO@.
+newIO :: IO (TokenQueue a)
+newIO = do
+  popEnd <- newTVarIO PushEnd
+  pushEnd <- newTVarIO popEnd
+  pure (TokenQueue popEnd pushEnd)
+{-# INLINEABLE newIO #-}
 
--- | Push an element onto a queue.
---
--- @pushTokenQueue@ returns an action that attempts to delete the element from
--- the queue.
---
--- The action returns:
---
--- * @True@ if the element was successfully deleted from the queue
---
--- * @False@ if the element had already been popped or deleted from the queue
-pushTokenQueue :: TokenQueue a -> a -> STM (STM Bool)
-pushTokenQueue (TokenQueue _pop push) lbjVal = do
-  -- In these variable names,
-  --   "jfk" refers to the old latest element (before this push)
-  --   "lbj" refers to the new latest element (this push)
-  -- referring to the US president JFK who was succeeded by LBJ
-  jfkForward <- readTVar push
-  lbjBack <- newTVar jfkForward
-  lbjForward <- newTVar End
-  writeTVar jfkForward (Node lbjBack lbjVal lbjForward)
-  writeTVar push lbjForward
-  pure (maybeDeleteSelf push lbjBack lbjForward)
-{-# INLINEABLE pushTokenQueue #-}
+-- | \(\mathcal{O}(1)\). Push an element onto a queue, and return a token that can be used to attempt to delete the element from the queue.
+push :: TokenQueue a -> a -> STM Token
+push (TokenQueue _ pushEnd) val = do
+  prevForward <- readTVar pushEnd
+  back <- newTVar prevForward
+  forward <- newTVar PushEnd
+  writeTVar prevForward (Node back val forward)
+  writeTVar pushEnd forward
+  pure (Token (maybeDeleteSelf pushEnd back forward))
+{-# INLINEABLE push #-}
 
--- | Pop an element from a queue.
-popTokenQueue :: TokenQueue a -> STM (Maybe a)
-popTokenQueue (TokenQueue pop push) = do
-  readTVar pop >>= \case
-    End -> pure Nothing
+-- | \(\mathcal{O}(1)\). Like 'push', but for when its return value is not needed.
+push_ :: TokenQueue a -> a -> STM ()
+push_ queue val =
+  void (push queue val)
+{-# INLINE push_ #-}
+
+-- | \(\mathcal{O}(1)\). Pop an element from a queue.
+pop :: TokenQueue a -> STM (Maybe a)
+pop (TokenQueue popEnd pushEnd) = do
+  readTVar popEnd >>= \case
+    PushEnd -> pure Nothing
     Node back val forward -> do
-      deleteSelf push back pop forward
+      deleteSelf pushEnd back popEnd forward
       pure (Just val)
-{-# INLINEABLE popTokenQueue #-}
+{-# INLINEABLE pop #-}
+
+-- | \(\mathcal{O}(1)\). Attempt to delete an element from a queue and return whether the delete was successful (where
+-- 'False' indicates the element was no longer in the queue because it had either already been popped or deleted).
+delete :: Token -> STM Bool
+delete =
+  coerce
+{-# INLINE delete #-}
+
+-- | \(\mathcal{O}(1)\). Like 'delete', but for when its return value is not needed.
+delete_ :: Token -> STM ()
+delete_ =
+  void . delete
+{-# INLINE delete_ #-}
 
 maybeDeleteSelf ::
   -- The queue's push end
-  LinkedListPP a ->
+  ListPP a ->
   -- Our back pointer
-  LinkedListPP a ->
+  ListPP a ->
   -- Our forward pointter
-  LinkedListP a ->
+  ListP a ->
   STM Bool
-maybeDeleteSelf push back forward = do
+maybeDeleteSelf pushEnd back forward = do
   prevForward <- readTVar back
   -- If our back pointer points to our forward pointer then we have
   -- already been deleted from the queue
   case prevForward == forward of
     True -> pure False
     False -> do
-      deleteSelf push back prevForward forward
+      deleteSelf pushEnd back prevForward forward
       pure True
 {-# INLINE maybeDeleteSelf #-}
 
@@ -150,19 +167,19 @@ maybeDeleteSelf push back forward = do
 -- already been deleted.
 deleteSelf ::
   -- The queue's push end
-  LinkedListPP a ->
+  ListPP a ->
   -- Our back pointer
-  LinkedListPP a ->
+  ListPP a ->
   -- Our back pointer's contents, the previous node's forward pointer
-  LinkedListP a ->
+  ListP a ->
   -- Our forward pointer
-  LinkedListP a ->
+  ListP a ->
   STM ()
-deleteSelf push back prevForward forward = do
+deleteSelf pushEnd back prevForward forward = do
   next <- readTVar forward
   writeTVar prevForward next
   case next of
-    End -> writeTVar push prevForward
+    PushEnd -> writeTVar pushEnd prevForward
     Node nextBack _ _ -> writeTVar nextBack prevForward
   -- point the back pointer to the forward pointer as a sign that
   -- the cell has been deleted (referenced in maybeDeleteSelf)
