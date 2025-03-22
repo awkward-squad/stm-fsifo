@@ -6,6 +6,7 @@ module Main (main) where
 
 import Control.Applicative (optional)
 import Control.Concurrent.STM
+import Control.Concurrent.STM.TokenQueue (TokenQueue)
 import Control.Concurrent.STM.TokenQueue qualified as TokenQueue
 import Control.Monad.IO.Class
 import Data.IntMap (IntMap)
@@ -42,7 +43,8 @@ prop_queue = property do
         [ s_push qvar,
           s_check qvar,
           s_removeSelf qvar,
-          s_pop qvar
+          s_pop qvar,
+          s_peek qvar
         ]
   evalIO (resetQ qvar)
   executeSequential initialState actions
@@ -80,24 +82,50 @@ prop_queue = property do
           preCond = Require \model _ -> model.isChecked
        in Command gen execute [upd, preCond]
 
+    s_pop :: TVar (TokenQueue Int) -> Command Gen (PropertyT IO) QueueModel
     s_pop qvar =
-      let gen model =
+      let gen :: QueueModel Symbolic -> Maybe (Gen (Pop Symbolic))
+          gen model =
             case model.isChecked of
               True -> Just (pure Pop)
               False -> Nothing
+          execute :: Pop Concrete -> PropertyT IO (Maybe Int)
           execute Pop = do
             liftIO $ atomically do
               q <- readTVar qvar
               optional (TokenQueue.pop q)
-          upd = Update \(QueueModel s pushCount im _) Pop _out ->
+          upd :: QueueModel v -> Pop v -> Var (Maybe Int) v -> QueueModel v
+          upd (QueueModel s pushCount im _) Pop _out =
             let mk = fst <$> IM.lookupGE minBound s
                 s' = maybe s (\k -> IM.delete k s) mk
              in QueueModel s' pushCount im False
-          precond = Require \model _ -> model.isChecked
-          postcond = Ensure \model _ _ actualPop ->
+          precond :: QueueModel Symbolic -> Pop Symbolic -> Bool
+          precond model _ = model.isChecked
+          postcond :: QueueModel Concrete -> QueueModel Concrete -> Pop Concrete -> Maybe Int -> Test ()
+          postcond model _ _ actualPop =
             let smallestElem = snd <$> IM.lookupGE minBound model.queueRep
              in smallestElem === actualPop
-       in Command gen execute [upd, precond, postcond]
+       in Command gen execute [Update upd, Require precond, Ensure postcond]
+
+    s_peek :: TVar (TokenQueue Int) -> Command Gen (PropertyT IO) QueueModel
+    s_peek qvar =
+      let gen :: QueueModel Symbolic -> Maybe (Gen (Peek Symbolic))
+          gen model =
+            case model.isChecked of
+              True -> Just (pure Peek)
+              False -> Nothing
+          execute :: Peek Concrete -> PropertyT IO (Maybe Int)
+          execute Peek = do
+            liftIO $ atomically do
+              q <- readTVar qvar
+              optional (TokenQueue.peek q)
+          precond :: QueueModel Symbolic -> Peek Symbolic -> Bool
+          precond model _ = model.isChecked
+          postcond :: QueueModel Concrete -> QueueModel Concrete -> Peek Concrete -> Maybe Int -> Test ()
+          postcond model _ _ actualPeek =
+            let smallestElem = snd <$> IM.lookupGE minBound model.queueRep
+             in smallestElem === actualPeek
+       in Command gen execute [Require precond, Ensure postcond]
 
     s_removeSelf _ =
       let gen model =
@@ -161,6 +189,10 @@ data Check (v :: Type -> Type) = Check
   deriving anyclass (FunctorB, TraversableB)
 
 data Pop (v :: Type -> Type) = Pop
+  deriving stock (Show, Eq, Generic)
+  deriving anyclass (FunctorB, TraversableB)
+
+data Peek (v :: Type -> Type) = Peek
   deriving stock (Show, Eq, Generic)
   deriving anyclass (FunctorB, TraversableB)
 
