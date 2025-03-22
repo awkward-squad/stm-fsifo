@@ -49,7 +49,7 @@ library
     stm ^>= 2.5.0,
   default-extensions:
     LambdaCase
-  exposed-modules: Control.Concurrent.STM.Fsifo
+  exposed-modules: Control.Concurrent.STM.TokenQueue
   hs-source-dirs: lib
 
 test-suite test

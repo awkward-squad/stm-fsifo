@@ -1,9 +1,9 @@
-module Control.Concurrent.STM.Fsifo
-  ( Fsifo,
-    newFsifo,
-    newFsifoIO,
-    pushFsifo,
-    popFsifo,
+module Control.Concurrent.STM.TokenQueue
+  ( TokenQueue,
+    newTokenQueue,
+    newTokenQueueIO,
+    pushTokenQueue,
+    popTokenQueue,
   )
 where
 
@@ -14,16 +14,16 @@ import Control.Concurrent.STM (STM, TVar, newTVar, newTVarIO, readTVar, writeTVa
 --   * \(\mathcal{O}(1)\) push
 --   * \(\mathcal{O}(1)\) pop
 --   * \(\mathcal{O}(1)\) delete
-data Fsifo a
-  = Fsifo
-       -- Pop end (see below)
-       -- Invariant: if queue is non-empty, points at a node whose back-pointer points right back here
+data TokenQueue a
+  = TokenQueue
+      -- Pop end (see below)
+      -- Invariant: if queue is non-empty, points at a node whose back-pointer points right back here
       {-# UNPACK #-} !(LinkedListP a)
       -- Push end (see below)
       -- Invariant: points at the one pointer that's pointing at End
       {-# UNPACK #-} !(LinkedListPP a)
 
--- A Fsifo containing elements [1, 2, 3] is depicted by the following diagram:
+-- A token queue containing elements [1, 2, 3] is depicted by the following diagram:
 --
 --              +-----+-----+-----+          +-----+-----+-----+          +-----+-----+-----+
 --     +-> Node |     |  1  |   ------> Node |     |  2  |   ------> Node |     |  3  |   ------> End
@@ -78,24 +78,24 @@ type LinkedListPP a =
   TVar (LinkedListP a)
 
 -- | Create a queue.
-newFsifo :: STM (Fsifo a)
-newFsifo = do
+newTokenQueue :: STM (TokenQueue a)
+newTokenQueue = do
   pop <- newTVar End
   push <- newTVar pop
-  pure (Fsifo pop push)
-{-# INLINEABLE newFsifo #-}
+  pure (TokenQueue pop push)
+{-# INLINEABLE newTokenQueue #-}
 
 -- | Create a queue in @IO@.
-newFsifoIO :: IO (Fsifo a)
-newFsifoIO = do
+newTokenQueueIO :: IO (TokenQueue a)
+newTokenQueueIO = do
   pop <- newTVarIO End
   push <- newTVarIO pop
-  pure (Fsifo pop push)
-{-# INLINEABLE newFsifoIO #-}
+  pure (TokenQueue pop push)
+{-# INLINEABLE newTokenQueueIO #-}
 
 -- | Push an element onto a queue.
 --
--- @pushFsifo@ returns an action that attempts to delete the element from
+-- @pushTokenQueue@ returns an action that attempts to delete the element from
 -- the queue.
 --
 -- The action returns:
@@ -103,8 +103,8 @@ newFsifoIO = do
 -- * @True@ if the element was successfully deleted from the queue
 --
 -- * @False@ if the element had already been popped or deleted from the queue
-pushFsifo :: Fsifo a -> a -> STM (STM Bool)
-pushFsifo (Fsifo _pop push) lbjVal = do
+pushTokenQueue :: TokenQueue a -> a -> STM (STM Bool)
+pushTokenQueue (TokenQueue _pop push) lbjVal = do
   -- In these variable names,
   --   "jfk" refers to the old latest element (before this push)
   --   "lbj" refers to the new latest element (this push)
@@ -115,17 +115,17 @@ pushFsifo (Fsifo _pop push) lbjVal = do
   writeTVar jfkForward (Node lbjBack lbjVal lbjForward)
   writeTVar push lbjForward
   pure (maybeDeleteSelf push lbjBack lbjForward)
-{-# INLINEABLE pushFsifo #-}
+{-# INLINEABLE pushTokenQueue #-}
 
 -- | Pop an element from a queue.
-popFsifo :: Fsifo a -> STM (Maybe a)
-popFsifo (Fsifo pop push) = do
+popTokenQueue :: TokenQueue a -> STM (Maybe a)
+popTokenQueue (TokenQueue pop push) = do
   readTVar pop >>= \case
     End -> pure Nothing
     Node back val forward -> do
       deleteSelf push back pop forward
       pure (Just val)
-{-# INLINEABLE popFsifo #-}
+{-# INLINEABLE popTokenQueue #-}
 
 maybeDeleteSelf ::
   -- The queue's push end

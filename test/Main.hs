@@ -11,7 +11,7 @@
 module Main (main) where
 
 import Control.Concurrent.STM
-import qualified Control.Concurrent.STM.Fsifo as Fsifo
+import qualified Control.Concurrent.STM.TokenQueue as TokenQueue
 import Control.Monad.IO.Class
 import Data.IntMap (IntMap)
 import qualified Data.IntMap.Strict as IM
@@ -38,7 +38,7 @@ main =
 
 prop_queue :: Property
 prop_queue = property do
-  qvar <- liftIO $ newTVarIO =<< Fsifo.newFsifoIO
+  qvar <- liftIO $ newTVarIO =<< TokenQueue.newTokenQueueIO
   actions <-
     forAll $
       Gen.sequential
@@ -61,7 +61,7 @@ prop_queue = property do
         }
 
     resetQ qvar = atomically do
-      q <- Fsifo.newFsifo
+      q <- TokenQueue.newTokenQueue
       writeTVar qvar q
 
     s_push qvar =
@@ -74,7 +74,7 @@ prop_queue = property do
               <$> liftIO
                 ( atomically do
                     q <- readTVar qvar
-                    Fsifo.pushFsifo q n
+                    TokenQueue.pushTokenQueue q n
                 )
           upd = Update \(QueueModel s pushCount im _) (Push i) out ->
             let !pushCount' = pushCount + 1
@@ -92,7 +92,7 @@ prop_queue = property do
           execute Pop = do
             liftIO $ atomically do
               q <- readTVar qvar
-              Fsifo.popFsifo q
+              TokenQueue.popTokenQueue q
           upd = Update \(QueueModel s pushCount im _) Pop _out ->
             let mk = fst <$> IM.lookupGE minBound s
                 s' = maybe s (\k -> IM.delete k s) mk
@@ -173,7 +173,7 @@ data RemoveSelf (v :: Type -> Type) = RemoveSelf Int (Var DeleteFromQueue v)
   deriving stock (Show, Generic)
   deriving anyclass (FunctorB, TraversableB)
 
-peekAll :: Fsifo.Fsifo a -> STM [a]
+peekAll :: TokenQueue.TokenQueue a -> STM [a]
 peekAll = toList . unsafeCoerce
 
 toList :: Q a -> STM [a]
@@ -192,7 +192,7 @@ data Q a
       {-# UNPACK #-} !(TVar (TVar (TDList a)))
 
 -- | Each element has a pointer to the previous element's forward
--- pointer where "previous element" can be a 'TDList' or the 'Fsifo'
+-- pointer where "previous element" can be a 'TDList' or the 'TokenQueue'
 -- head pointer.
 data TDList a
   = TCons
