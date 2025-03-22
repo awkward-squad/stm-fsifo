@@ -4,6 +4,7 @@
 
 module Main (main) where
 
+import Control.Applicative (optional)
 import Control.Concurrent.STM
 import Control.Concurrent.STM.TokenQueue qualified as TokenQueue
 import Control.Monad.IO.Class
@@ -86,7 +87,7 @@ prop_queue = property do
           execute Pop = do
             liftIO $ atomically do
               q <- readTVar qvar
-              TokenQueue.pop q
+              optional (TokenQueue.pop q)
           upd = Update \(QueueModel s pushCount im _) Pop _out ->
             let mk = fst <$> IM.lookupGE minBound s
                 s' = maybe s (\k -> IM.delete k s) mk

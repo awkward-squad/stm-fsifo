@@ -6,12 +6,14 @@ module Control.Concurrent.STM.TokenQueue
     push,
     push_,
     pop,
+    peek,
     delete,
     delete_,
   )
 where
 
 import Control.Concurrent.STM (STM, TVar, newTVar, newTVarIO, readTVar, writeTVar)
+import Control.Monad.STM (retry)
 import Data.Coerce (coerce)
 import Data.Functor (void)
 
@@ -105,6 +107,8 @@ newIO = do
 {-# INLINEABLE newIO #-}
 
 -- | \(\mathcal{O}(1)\). Push an element onto a queue, and return a token that can be used to attempt to delete the element from the queue.
+--
+-- This function never blocks.
 push :: TokenQueue a -> a -> STM Token
 push (TokenQueue _ pushEnd) val = do
   prevForward <- readTVar pushEnd
@@ -122,17 +126,31 @@ push_ queue val =
 {-# INLINE push_ #-}
 
 -- | \(\mathcal{O}(1)\). Pop an element from a queue.
-pop :: TokenQueue a -> STM (Maybe a)
+--
+-- This function blocks if the queue is empty.
+pop :: TokenQueue a -> STM a
 pop (TokenQueue popEnd pushEnd) = do
   readTVar popEnd >>= \case
-    PushEnd -> pure Nothing
+    PushEnd -> retry
     Node back val forward -> do
       deleteSelf pushEnd back popEnd forward
-      pure (Just val)
+      pure val
 {-# INLINEABLE pop #-}
+
+-- | \(\mathcal{O}(1)\). Peek at the first element in a queue.
+--
+-- This function blocks if the queue is empty.
+peek :: TokenQueue a -> STM a
+peek (TokenQueue popEnd _) = do
+  readTVar popEnd >>= \case
+    PushEnd -> retry
+    Node _ val _ -> pure val
+{-# INLINEABLE peek #-}
 
 -- | \(\mathcal{O}(1)\). Attempt to delete an element from a queue and return whether the delete was successful (where
 -- 'False' indicates the element was no longer in the queue because it had either already been popped or deleted).
+--
+-- This function never blocks.
 delete :: Token -> STM Bool
 delete =
   coerce
