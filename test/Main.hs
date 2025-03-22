@@ -55,9 +55,10 @@ prop_queue = property do
           isChecked = True
         }
 
-    resetQ qvar = atomically do
-      q <- TokenQueue.new
-      writeTVar qvar q
+    resetQ qvar =
+      atomically do
+        q <- TokenQueue.new
+        writeTVar qvar q
 
     s_push qvar =
       let gen model =

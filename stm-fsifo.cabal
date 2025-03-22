@@ -50,7 +50,7 @@ library
   default-extensions:
     LambdaCase
   exposed-modules: Control.Concurrent.STM.TokenQueue
-  hs-source-dirs: lib
+  hs-source-dirs: src
 
 test-suite test
   import: component
